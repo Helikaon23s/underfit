@@ -3229,6 +3229,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             run_demo_prompts = None
             _frontend_gt = body.get("ground_truth")  # sent by frontend with source files
 
+            # If the frontend didn't send GT (likely because the dataset's GT
+            # was still being generated when the user clicked "Launch"),
+            # synthesize a slot list matched to the demo_cond length so the
+            # fill-from-dataset logic below can populate them from the
+            # dataset's known dataset_files.
+            _demo_cond_for_gt = cfg.get("training", {}).get("demo", {}).get("demo_cond", [])
+            if not _frontend_gt and _demo_cond_for_gt and dataset_id:
+                _frontend_gt = [{} for _ in _demo_cond_for_gt]
+
             # Fill missing sourceFiles with random dataset tracks so every demo
             # gets a GT to play. No repeats within this list — once a track is
             # claimed (either by an explicit attachment or a random pick), it
