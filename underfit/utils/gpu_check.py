@@ -12,20 +12,39 @@ def _silence_compile_noise() -> None:
     """Silence torch's autotune / dynamo / inductor log channels.
 
     These emit W/E-level messages when torch.compile falls back to eager —
-    which is a graceful degradation, NOT a real failure. The fallback runs
-    the eager-mode path and training/encoding completes normally. The
-    messages look terrifying (multi-screen stack traces) but they're noise.
+    a graceful degradation, NOT a real failure. The fallback runs the eager
+    path and training completes normally. The messages look terrifying
+    (multi-screen stack traces) but they're noise.
 
-    We silence the entire torch._dynamo and torch._inductor logger trees.
-    Real runtime errors come through different loggers and still surface."""
+    We silence three layers:
+      1. Standard Python loggers under torch._dynamo / torch._inductor
+      2. torch._logging.set_logs() — torch's own glog-style logger (the
+         source of the `W0522` / `E0522` prefixed lines)
+      3. Best-effort suppression for child loggers (triton_heuristics,
+         select_algorithm, convert_frame) that may have explicit levels.
+
+    Some output still leaks through — the MLIR / LLVM crash banners on
+    flex_attention compile failure come from C++ stderr writes, not Python
+    logging. Those would require dup2() of fd 2, which is too invasive."""
     import logging
     for mod in (
+        "torch",
         "torch._dynamo",
         "torch._inductor",
         "torch._inductor.select_algorithm",
+        "torch._inductor.runtime",
+        "torch._inductor.runtime.triton_heuristics",
         "torch._dynamo.convert_frame",
     ):
         logging.getLogger(mod).setLevel(logging.CRITICAL)
+    try:
+        import torch._logging
+        torch._logging.set_logs(
+            dynamo=logging.CRITICAL,
+            inductor=logging.CRITICAL,
+        )
+    except Exception:
+        pass
 
 
 def check_attention_compute_capability() -> bool | None:
