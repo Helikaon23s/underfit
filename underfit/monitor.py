@@ -31,8 +31,12 @@ def _get(url: str, fallback: Any) -> Any:
         return fallback
 
 
+_PEAKS: dict[str, float] = {}  # session peaks (RAM in GB, per-GPU VRAM in MB)
+
+
 def fetch_status(base_url: str = "http://localhost:8787") -> dict[str, Any]:
-    """Snapshot of dashboard state. Returns `{'error': msg}` if unreachable."""
+    """Snapshot of dashboard state + local system RAM + GPU VRAM (via dashboard).
+    Returns `{'error': msg}` if dashboard is unreachable."""
     runs_resp = _get(f"{base_url}/api/runs", None)
     if runs_resp is None:
         return {"error": f"can't reach {base_url}"}
@@ -56,6 +60,32 @@ def fetch_status(base_url: str = "http://localhost:8787") -> dict[str, Any]:
         status_counts[s] = status_counts.get(s, 0) + 1
     active_gradios = sum(1 for g in gradios if g.get("status") in ("ready", "starting"))
 
+    # System RAM via psutil (we share a VM with the dashboard, so local read is fine)
+    ram = None
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        used_gb = (vm.total - vm.available) / 1e9
+        ram = {"used_gb": round(used_gb, 2), "total_gb": round(vm.total / 1e9, 2)}
+        _PEAKS["ram_gb"] = max(_PEAKS.get("ram_gb", 0.0), used_gb)
+        ram["peak_gb"] = round(_PEAKS["ram_gb"], 2)
+    except Exception:
+        pass
+
+    # GPU VRAM via dashboard's /api/gpu — list of {gpu, used_mb, total_mb, util_pct, ...}
+    gpu_resp = _get(f"{base_url}/api/gpu", {})
+    if isinstance(gpu_resp, dict):
+        gpus = gpu_resp.get("gpus", [])
+    else:
+        gpus = gpu_resp or []
+    for g in gpus:
+        idx = g.get("gpu")
+        if idx is None:
+            continue
+        key = f"gpu_{idx}_mb"
+        _PEAKS[key] = max(_PEAKS.get(key, 0.0), g.get("used_mb", 0))
+        g["peak_mb"] = int(_PEAKS[key])
+
     return {
         "runs": runs,
         "datasets": datasets,
@@ -64,6 +94,8 @@ def fetch_status(base_url: str = "http://localhost:8787") -> dict[str, Any]:
         "dataset_count": len(datasets),
         "active_gradios": active_gradios,
         "status_counts": status_counts,
+        "ram": ram,
+        "gpus": gpus,
     }
 
 
@@ -76,9 +108,20 @@ def format_text(data: dict[str, Any]) -> str:
     runs_str = f"{data['runs_total']} total"
     if sc:
         runs_str += f" ({', '.join(f'{n} {s}' for s, n in sorted(sc.items()))})"
-    return (f"[{ts}] runs: {runs_str}"
-            f" | datasets: {data['dataset_count']}"
-            f" | gradio: {data['active_gradios']} active")
+    parts = [
+        f"[{ts}] runs: {runs_str}",
+        f"datasets: {data['dataset_count']}",
+        f"gradio: {data['active_gradios']} active",
+    ]
+    if data.get("ram"):
+        r = data["ram"]
+        parts.append(f"RAM: {r['used_gb']:.1f}/{r['total_gb']:.1f} GB (peak {r['peak_gb']:.1f})")
+    for g in data.get("gpus", []):
+        gu = g["used_mb"] / 1024
+        gt = g["total_mb"] / 1024
+        gp = g.get("peak_mb", 0) / 1024
+        parts.append(f"GPU{g['gpu']}: {gu:.1f}/{gt:.1f} GB (peak {gp:.1f}, {g.get('util_pct', 0)}%)")
+    return " | ".join(parts)
 
 
 def format_html(data: dict[str, Any]) -> str:
@@ -90,10 +133,22 @@ def format_html(data: dict[str, Any]) -> str:
     sc = ", ".join(f"{n} {s}" for s, n in sorted(data["status_counts"].items())) or "none"
     lines = [
         f"<b>📊 underfit @ {ts}</b>",
-        f"  Runs: {data['runs_total']} total ({sc})",
+        f"  Runs:     {data['runs_total']} total ({sc})",
         f"  Datasets: {data['dataset_count']}",
-        f"  Gradio instances: {data['active_gradios']} active",
+        f"  Gradios:  {data['active_gradios']} active",
     ]
+    if data.get("ram"):
+        r = data["ram"]
+        pct = 100 * r["used_gb"] / max(r["total_gb"], 0.001)
+        lines.append(f"  RAM:      {r['used_gb']:5.1f} / {r['total_gb']:5.1f} GB  "
+                     f"({pct:4.1f}%, peak {r['peak_gb']:5.1f} GB)")
+    for g in data.get("gpus", []):
+        gu = g["used_mb"] / 1024
+        gt = g["total_mb"] / 1024
+        gp = g.get("peak_mb", 0) / 1024
+        pct = 100 * gu / max(gt, 0.001)
+        lines.append(f"  GPU {g['gpu']:>2}:    {gu:5.1f} / {gt:5.1f} GB  "
+                     f"({pct:4.1f}%, peak {gp:5.1f} GB, util {g.get('util_pct', 0):>3}%)")
     return ("<pre style='margin:0;font-family:monospace;line-height:1.4'>"
             + "\n".join(lines) + "</pre>")
 
