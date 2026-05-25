@@ -338,11 +338,21 @@ def run_training(args, backend):
             if hasattr(cond, "tokenizer") and hasattr(cond, "max_length"):
                 tokenizers[key] = (cond.tokenizer, cond.max_length)
 
+    # Cap num_workers to host capacity. Colab T4 has 2 CPUs; requesting 8
+    # workers triggers PyTorch's "too many workers" warning AND can actually
+    # slow things down via context-switching. Leave 1 core for the main
+    # process. Minimum 1 worker (0 means "load on main", which can deadlock
+    # the prefetcher in some PyTorch versions).
+    effective_workers = max(1, min(args.num_workers, max(1, (os.cpu_count() or 2) - 1)))
+    if effective_workers != args.num_workers:
+        print(f"[startup] num_workers {args.num_workers} → {effective_workers} "
+              f"(host has {os.cpu_count()} CPUs)", flush=True)
+
     print("[startup] Building dataloader …", flush=True)
     train_dl = backend.create_dataloader(
         dataset_config,
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        num_workers=effective_workers,
         sample_rate=sample_rate,
         sample_size=sample_size,
         audio_channels=audio_channels,
