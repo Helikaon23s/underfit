@@ -1259,7 +1259,7 @@
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:8px;align-items:end">
         <div>
           <label class="modal-label">Latent seq length</label>
-          <input type="number" class="resume-input" id="new-ft-crop-length" min="1" step="1" pattern="[0-9]*" value="3072" oninput="this.value=this.value.replace(/[^0-9]/g,'');if(!this.value){const m=document.getElementById('new-ft-base-model').value||'sa3';this.value=(_modelSeqInfo[m]||_modelSeqInfo['sa3']).length}else if(parseInt(this.value)<1)this.value='1';_updateCropSeconds();updateCkptEstimate()">
+          <input type="number" class="resume-input" id="new-ft-crop-length" min="1" step="1" pattern="[0-9]*" value="3072" oninput="_updateCropSeconds();updateCkptEstimate();validateNewFt()">
         </div>
         <div>
           <label class="modal-label">Duration</label>
@@ -5831,6 +5831,10 @@ window.validateNewFt = function() {
   else if (isNaN(ckptEvery) || ckptEvery < 1) error = 'Ckpt every must be >= 1';
   else if (isNaN(demoEvery) || demoEvery < 1) error = 'Demo every must be >= 1';
   else if (lrStr && isNaN(Number(lrStr))) error = 'LR must be a number (e.g. 1e-4)';
+  else {
+    const cropLen = parseInt(document.getElementById('new-ft-crop-length').value, 10);
+    if (isNaN(cropLen) || cropLen < 1) error = 'Latent seq length must be >= 1';
+  }
   // Show name errors next to the label; other errors in the estimate area
   const nameLabelEl = document.getElementById('new-ft-name').parentElement.querySelector('.modal-label');
   const isNameError = error === '_name_empty' || error.startsWith('Run "');
