@@ -18,6 +18,7 @@ import html as _html
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -692,25 +693,31 @@ def launch_dashboard_subprocess(*, port: int = 8787,
     return proc
 
 
-def start_monitor(base_url: str = "http://localhost:8787",
-                  interval: int = 10,
-                  mode: str = "auto",
-                  on_unreachable=None,
-                  failure_threshold: int = 3) -> None:
-    """Poll the dashboard and refresh a status block until KeyboardInterrupt.
+class MonitorHandle:
+    """Returned by `start_monitor(background=True)`. Call `.stop()` to halt
+    the background polling thread. `.is_alive()` reports whether it's still
+    running. Re-entrant: `.stop()` on an already-stopped handle is a no-op."""
+    def __init__(self, thread: threading.Thread, stop_event: threading.Event):
+        self._thread = thread
+        self._stop = stop_event
 
-    mode="auto" (default) renders HTML in IPython and text in a terminal.
-    Force a specific mode with mode="html" or mode="text".
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=timeout)
 
-    on_unreachable: optional callable() invoked when the dashboard has been
-    unreachable for `failure_threshold` consecutive polls (default 3 — so ~30s
-    of failures at the default 10s interval before triggering). Use it to
-    auto-restart the dashboard. Exceptions raised by the callable are caught
-    and printed; the monitor keeps running either way.
-    """
-    if mode == "auto":
-        mode = _detect_mode()
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
+    def __repr__(self) -> str:
+        state = "alive" if self.is_alive() else "stopped"
+        return f"<MonitorHandle {state}>"
+
+
+def _monitor_loop(base_url, interval, mode, on_unreachable, failure_threshold,
+                  stop_event):
+    """Shared body of start_monitor (foreground + background). `stop_event`
+    is None for foreground (use KeyboardInterrupt) and a threading.Event for
+    background (set by MonitorHandle.stop)."""
     display_id = "underfit-status"
     if mode == "html":
         from IPython.display import display, update_display, HTML
@@ -721,7 +728,13 @@ def start_monitor(base_url: str = "http://localhost:8787",
     failures = 0
     try:
         while True:
-            time.sleep(interval)
+            if stop_event is not None:
+                # wait() with timeout: returns True when set (→ stop),
+                # False on timeout (→ continue polling)
+                if stop_event.wait(timeout=interval):
+                    break
+            else:
+                time.sleep(interval)
             data = fetch_status(base_url)
             if "error" in data:
                 failures += 1
@@ -738,11 +751,54 @@ def start_monitor(base_url: str = "http://localhost:8787",
                 failures = 0
 
             if mode == "html":
+                from IPython.display import update_display, HTML
                 update_display(HTML(format_html(data)), display_id=display_id)
             else:
                 print(format_text(data), flush=True)
     except KeyboardInterrupt:
         print("\nStatus monitor stopped.")
+
+
+def start_monitor(base_url: str = "http://localhost:8787",
+                  interval: int = 10,
+                  mode: str = "auto",
+                  on_unreachable=None,
+                  failure_threshold: int = 3,
+                  background: bool = False):
+    """Poll the dashboard and refresh a status block.
+
+    mode="auto" (default) renders HTML in IPython and text in a terminal.
+    Force a specific mode with mode="html" or mode="text".
+
+    on_unreachable: optional callable() invoked when the dashboard has been
+    unreachable for `failure_threshold` consecutive polls (default 3 — so ~30s
+    of failures at the default 10s interval before triggering). Use it to
+    auto-restart the dashboard. Exceptions raised by the callable are caught
+    and printed; the monitor keeps running either way.
+
+    background=False (default) blocks the calling cell/process until
+    KeyboardInterrupt — old behavior. background=True runs the polling loop
+    in a daemon thread and returns a MonitorHandle immediately, leaving the
+    kernel idle so other Colab cells (and ipywidgets buttons like Restart
+    Dashboard) can fire while polling continues. Call `.stop()` on the
+    handle to halt polling.
+    """
+    if mode == "auto":
+        mode = _detect_mode()
+
+    if background:
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_monitor_loop,
+            args=(base_url, interval, mode, on_unreachable, failure_threshold, stop_event),
+            daemon=True,
+            name="underfit-monitor",
+        )
+        thread.start()
+        return MonitorHandle(thread, stop_event)
+
+    _monitor_loop(base_url, interval, mode, on_unreachable, failure_threshold, None)
+    return None
 
 
 def debug_info(state_dir: str = "/content/drive/MyDrive/underfit-state",
