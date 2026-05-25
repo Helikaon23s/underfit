@@ -4138,6 +4138,14 @@ async function refresh() {
       document.getElementById('status-text').style.display = 'none';
       document.getElementById('new-finetune-btn').style.display = '';
       document.getElementById('new-dataset-btn').style.display = '';
+      // Also show DATASETS button if any datasets exist — without this the
+      // user has no way to reach the dataset list until they have a run.
+      fetch('/api/datasets').then(r => r.json()).then(ds => {
+        const _has = Array.isArray(ds) && ds.length > 0;
+        window._hasDatasets = _has;
+        window._datasetsChecked = true;
+        document.getElementById('datasets-btn').style.display = _has ? '' : 'none';
+      }).catch(() => {});
       document.getElementById('main-loading').classList.remove('active');
       // Still refresh GPUs so users can see VRAM availability.
       refreshGpu();
