@@ -2801,8 +2801,13 @@ def generate_spectrogram(mp3_path, jpg_path):
     """Generate a 300x60 3-band tinted stereo mel spectrogram."""
     try:
         y, sr = _load_audio(mp3_path, target_sr=32000)
+        # Force stereo. _load_audio returns 1D for mono-no-resample but 2D
+        # (1, N) for mono-after-resample (the interpolate branch unsqueezes
+        # mono inputs and never re-squeezes). Handle both.
         if y.ndim == 1:
             y = np.stack([y, y])
+        elif y.shape[0] == 1:
+            y = np.repeat(y, 2, axis=0)
 
         S_L, rgb_L = _mel_channel(y[0], sr)
         S_R, rgb_R = _mel_channel(y[1], sr)
