@@ -17,6 +17,7 @@ from __future__ import annotations
 import html as _html
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -495,6 +496,171 @@ def start_monitor(base_url: str = "http://localhost:8787",
                 print(format_text(data), flush=True)
     except KeyboardInterrupt:
         print("\nStatus monitor stopped.")
+
+
+def debug_info(state_dir: str = "/content/drive/MyDrive/underfit-state",
+               repo_dir: str = "/content/underfit",
+               n_runs: int = 1) -> None:
+    """Print a comprehensive diagnostic snapshot for the most recent run(s).
+
+    Designed for Colab: drop `from underfit.monitor import debug_info; debug_info()`
+    in a cell and paste the output when reporting a bug.
+
+    Includes:
+      - git commit + dirty state of the underfit checkout
+      - python interpreter, torch+CUDA build, supported archs
+      - all GPUs (nvidia-smi: name, compute_cap, driver, memory)
+      - dashboard process PID + start time
+      - disk usage (local + Drive when mounted)
+      - the N most recent runs: sibling files (log + sidecars), contents
+        of each non-JSON sidecar, files inside the run dir, runs.json
+        record
+
+    Failures in any section are caught and printed inline — the rest of the
+    report still runs.
+    """
+    import glob
+    import shutil
+    import subprocess
+
+    def _section(title):
+        print(f"\n{'='*4} {title} {'='*4}")
+
+    def _safe_run(cmd, **kw):
+        try:
+            return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT, **kw).strip()
+        except subprocess.CalledProcessError as e:
+            return f"<{cmd[0]} failed: {e.output.strip()[:200]}>"
+        except FileNotFoundError:
+            return f"<{cmd[0]} not on PATH>"
+        except Exception as e:
+            return f"<{type(e).__name__}: {e}>"
+
+    # ── repo ────────────────────────────────────────────────────────────
+    _section("underfit repo")
+    print(f"  path: {repo_dir}")
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        head = _safe_run(["git", "-C", repo_dir, "log", "-1", "--oneline"])
+        print(f"  HEAD: {head}")
+        status = _safe_run(["git", "-C", repo_dir, "status", "--porcelain"])
+        print(f"  dirty files: {len(status.splitlines()) if status else 0}")
+    else:
+        print(f"  (not a git checkout)")
+
+    # ── python / torch / CUDA ───────────────────────────────────────────
+    _section("python + torch")
+    print(f"  python: {sys.executable}")
+    print(f"  version: {sys.version.split()[0]}")
+    try:
+        import torch
+        print(f"  torch:  {torch.__version__}  (CUDA {torch.version.cuda})")
+        print(f"  archs:  {torch.cuda.get_arch_list()}")
+        print(f"  cuda available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                name = torch.cuda.get_device_name(i)
+                maj, mnr = torch.cuda.get_device_capability(i)
+                print(f"  GPU {i}: {name} (sm{maj}{mnr})")
+    except Exception as e:
+        print(f"  torch import failed: {type(e).__name__}: {e}")
+
+    # ── nvidia-smi (independent of torch) ──────────────────────────────
+    _section("nvidia-smi")
+    smi = _safe_run([
+        "nvidia-smi",
+        "--query-gpu=index,name,compute_cap,driver_version,memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ])
+    print(f"  {smi}" if "\n" not in smi else smi)
+
+    # ── dashboard process ───────────────────────────────────────────────
+    _section("dashboard process")
+    # Tight match: only real python interpreters running dashboard/server.py.
+    # Loose pgrep would also catch shell wrappers or unrelated processes.
+    ps = _safe_run(["pgrep", "-af", r"python[^[:space:]]* .*dashboard/server\.py"])
+    print(ps or "  (no dashboard/server.py process found)")
+
+    # ── disk usage ──────────────────────────────────────────────────────
+    _section("disk usage")
+    for label, path in (("Local /content", "/content"),
+                        ("Local /",        "/"),
+                        ("Drive MyDrive",  "/content/drive/MyDrive")):
+        if os.path.isdir(path):
+            try:
+                u = shutil.disk_usage(path)
+                pct = 100 * u.used / max(u.total, 1)
+                print(f"  {label:<20s} {u.used/1e9:7.1f} / {u.total/1e9:7.1f} GB  ({pct:5.1f}%)")
+            except OSError as e:
+                print(f"  {label:<20s} statfs failed: {e}")
+
+    # ── recent runs ─────────────────────────────────────────────────────
+    _section(f"latest {n_runs} run(s)")
+    runs_root = os.path.join(state_dir, "runs")
+    if not os.path.isdir(runs_root):
+        print(f"  no runs dir at {runs_root}")
+    else:
+        dirs = sorted(
+            [p for p in glob.glob(runs_root + "/*") if os.path.isdir(p)],
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for rd in dirs[:n_runs]:
+            run_id = os.path.basename(rd)
+            print(f"\n  --- {run_id} ---")
+            siblings = sorted(glob.glob(os.path.join(runs_root, run_id + "*")))
+            for p in siblings:
+                sz = os.path.getsize(p) if os.path.isfile(p) else "<dir>"
+                print(f"    {sz:>10}  {os.path.basename(p)}")
+            for p in siblings:
+                if not os.path.isfile(p):
+                    continue
+                name = os.path.basename(p)
+                if name.endswith(".json"):
+                    continue  # skip the big model/dataset config dumps
+                print(f"\n    === {name} ({os.path.getsize(p)} bytes) ===")
+                try:
+                    txt = open(p, errors="replace").read()
+                    if not txt.strip():
+                        print("    (empty)")
+                    else:
+                        for line in txt[:6000].splitlines():
+                            print(f"    {line}")
+                except OSError as e:
+                    print(f"    read failed: {e}")
+            print(f"\n    files inside {rd}:")
+            try:
+                for f in sorted(os.listdir(rd)):
+                    sub = os.path.join(rd, f)
+                    sz = os.path.getsize(sub) if os.path.isfile(sub) else "<dir>"
+                    print(f"      {sz:>10}  {f}")
+            except OSError as e:
+                print(f"      listdir failed: {e}")
+            # runs.json
+            try:
+                rj_path = os.path.join(state_dir, "runs.json")
+                rj = json.load(open(rj_path))
+                rj_list = rj if isinstance(rj, list) else rj.get("runs", [])
+                match = [r for r in rj_list if r.get("id") == run_id]
+                if match:
+                    r = match[0]
+                    print("\n    runs.json record:")
+                    for k in ("status", "pid", "gpu", "log_path", "kill_hint",
+                              "error", "created_at", "restart_count", "seed_lora"):
+                        if k in r:
+                            print(f"      {k}: {r[k]}")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    # ── module imports (catch broken installs early) ───────────────────
+    _section("import sanity")
+    for mod in ("underfit", "underfit.training.loop", "underfit.utils.lora_validate",
+                "safetensors", "huggingface_hub"):
+        try:
+            __import__(mod)
+            print(f"  ✓ {mod}")
+        except Exception as e:
+            print(f"  ✗ {mod}: {type(e).__name__}: {e}")
+    print()
 
 
 if __name__ == "__main__":
