@@ -2946,8 +2946,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     nl = raw.find(b"\n")
                     if nl >= 0:
                         raw = raw[nl + 1:]
+                text = raw.decode("utf-8", errors="replace")
+                # Hide '[gradio: ...' lines — they have their own tab in the
+                # Logs modal, no need to also show them in SERVER.
+                text = "\n".join(
+                    ln for ln in text.splitlines()
+                    if not ln.lstrip().startswith("[gradio:")
+                )
                 self._json_response({
-                    "log": raw.decode("utf-8", errors="replace"),
+                    "log": text,
                     "mtime": p.stat().st_mtime,
                     "size": size,
                 })
