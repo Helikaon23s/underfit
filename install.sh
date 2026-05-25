@@ -75,7 +75,7 @@ uv sync --inexact
 # ── 3. wizard ──────────────────────────────────────────────────────────────
 if [ "$SKIP_SETUP" -eq 1 ]; then
     say "skipping underfit-setup (--no-setup passed)"
-    say "done. Activate the venv with 'source .venv/bin/activate' or use 'uv run …'."
+    say "done — now run ./run.sh to start the dashboard."
     exit 0
 fi
 say "launching underfit-setup …"
@@ -84,3 +84,6 @@ if [ -n "$BACKEND" ]; then
 else
     uv run python -m underfit.cli.setup
 fi
+
+echo
+say "all done — now run ./run.sh to start the dashboard."
