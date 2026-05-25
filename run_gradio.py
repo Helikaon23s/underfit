@@ -7,12 +7,29 @@ CLI is the same as SAT-dev's run_gradio.py so dashboard launches don't need
 to change beyond pointing at this script.
 """
 import sys
+import warnings
+
+# Always-on suppression of two torchaudio UserWarnings that fire on every
+# inference call (the SA3 pretransform's mel-spec is reconstructed per call,
+# so the warnings re-emit each generation). These two are specifically known
+# noise; the broader filterwarnings("ignore") below covers the rest unless
+# --verbose was passed. Done as targeted filters so they survive any library
+# that calls warnings.resetwarnings() during init.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*'onesided' has been deprecated.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*At least one mel filterbank has all zero values.*",
+    category=UserWarning,
+)
 
 if "--verbose" not in sys.argv:
     import os as _os
     _os.environ.setdefault("PYTHONWARNINGS", "ignore")
-    import warnings as _warnings
-    _warnings.filterwarnings("ignore")
+    warnings.filterwarnings("ignore")
 
 import argparse
 import os
