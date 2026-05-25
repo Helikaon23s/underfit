@@ -4188,7 +4188,12 @@ function renderControlButtons(st, status) {
   const isActive = activeStates.includes(st);
   const restartTag = !isActive && status && status.restart_count ? `<span style="color:var(--orange);margin:0 6px;font-size:0.85em">restart ${status.restart_count}/3</span>` : '';
   const errorTag = !isActive && status && status.error ? `<span style="color:var(--red);margin:0 6px;font-size:0.85em">${status.error}</span>` : '';
-  let html = `<span class="control-status ${st}${useDots ? ' animated-dots' : ''}">${labels[st] || st}</span>${gpuTag}${restartTag}${errorTag}`;
+  // kill_hint surfaces from the server when a run died fast with empty log
+  // (likely OOM) or with a shell-level error captured in <log>.bash.err.
+  const _esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const hintTag = !isActive && run && run.kill_hint
+    ? `<span style="color:var(--orange);margin:0 6px;font-size:0.8em">⚠ ${_esc(run.kill_hint)}</span>` : '';
+  let html = `<span class="control-status ${st}${useDots ? ' animated-dots' : ''}">${labels[st] || st}</span>${gpuTag}${restartTag}${errorTag}${hintTag}`;
   if (_controlPending) {
     html += `<span class="control-spinner"></span>`;
     row.innerHTML = html;

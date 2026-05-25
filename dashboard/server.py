@@ -350,6 +350,55 @@ def _free_gpu_memory(gpu):
         print(f"[cleanup] cuda.empty_cache failed for GPU {gpu}: {e}")
 
 
+def _diagnose_quick_kill(run: dict) -> str | None:
+    """If a run died within 30 s with little/no log output, return a one-line
+    hint about the likely cause. None if the run is healthy or died later.
+
+    Checks (in order of usefulness):
+      1. `<log>.bash.err` — captures shell-level errors before the pipe (rare
+         but extremely useful: source-failures, syntax errors, etc.).
+      2. Elapsed time vs first/last log writes — short death + empty log
+         strongly suggests SIGKILL (OOM), since Python tracebacks would have
+         landed before the kernel pulls the plug.
+    """
+    log_path = run.get("log_path") or ""
+    bash_err = log_path + ".bash.err"
+    bash_err_txt = ""
+    if os.path.exists(bash_err):
+        try:
+            with open(bash_err, "rb") as f:
+                bash_err_txt = f.read(2048).decode("utf-8", errors="replace").strip()
+        except OSError:
+            pass
+    # Always surface bash-level errors — they're never normal.
+    if bash_err_txt:
+        first_line = bash_err_txt.splitlines()[0][:200]
+        return f"Shell error before training started: {first_line}"
+
+    # Elapsed time since launch
+    elapsed = None
+    try:
+        ts = run.get("created_at", "")
+        if ts:
+            elapsed = time.time() - datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        pass
+
+    # Log size — if there's substantive output, no hint needed; the user can read the log
+    log_size = 0
+    if log_path:
+        try:
+            log_size = os.path.getsize(log_path)
+        except OSError:
+            pass
+
+    if elapsed is not None and elapsed < 30 and log_size < 200:
+        return ("Process died in <30 s with no output — almost certainly SIGKILL "
+                "from the kernel OOM-killer. Check `dmesg | tail` for "
+                "'Killed process …', or try a smaller batch size / model.")
+    return None
+
+
 def _parse_latest_step(run):
     """Parse the latest global_step from a run's log file. Returns (step, max_steps) or (None, max_steps)."""
     log_path = Path(run.get("log_path", ""))
@@ -527,6 +576,10 @@ class RunsRegistry:
                     if status is not None:
                         print(f"[startup] Run '{r.get('display_name', r['id'])}' was {status}, PID {pid} dead → {new_status}")
                     r["status"] = new_status
+                    if new_status in ("killed", "error") and not r.get("kill_hint"):
+                        hint = _diagnose_quick_kill(r)
+                        if hint:
+                            r["kill_hint"] = hint
                     changed = True
         if changed:
             self._save()
@@ -1809,9 +1862,14 @@ class TrainingMonitor:
                         continue
                     # Paused runs that died — just mark killed, don't restart
                     if fresh_run.get("status") == "paused":
-                        self._registry.update_run(run_id, status="killed")
+                        hint = _diagnose_quick_kill(fresh_run)
+                        if hint:
+                            self._registry.update_run(run_id, status="killed", kill_hint=hint)
+                        else:
+                            self._registry.update_run(run_id, status="killed")
                         _free_gpu_memory(fresh_run.get("gpu"))
-                        print(f"[monitor] Paused run {run_id} PID {pid} died — marking killed")
+                        print(f"[monitor] Paused run {run_id} PID {pid} died — marking killed"
+                              + (f" ({hint})" if hint else ""))
                         continue
                     # PID died — check if completed
                     effective_step, max_steps = _parse_latest_step(fresh_run)
@@ -1843,9 +1901,14 @@ class TrainingMonitor:
 
                     # Crashed — attempt restart if we have a restart_cmd
                     if restart_cmd is None:
-                        self._registry.update_run(run_id, status="killed")
+                        hint = _diagnose_quick_kill(fresh_run)
+                        if hint:
+                            self._registry.update_run(run_id, status="killed", kill_hint=hint)
+                        else:
+                            self._registry.update_run(run_id, status="killed")
                         _free_gpu_memory(gpu)
-                        print(f"[monitor] Run {run_id} PID {pid} died, no restart_cmd — marking killed")
+                        print(f"[monitor] Run {run_id} PID {pid} died, no restart_cmd — marking killed"
+                              + (f" ({hint})" if hint else ""))
                         continue
                     # Cooldown: don't restart-loop if process keeps crashing
                     if not self._can_restart(run_id):
@@ -3399,11 +3462,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         ) if GRADIO_THREAD_CAP else ""
         backend_env = _backend_env_for_model(base_model)
         launch_cmd = f"source {VENV_ACTIVATE} && cd {_q(demo_dir)} && PYTHONUNBUFFERED=1 {backend_env}{thread_env}{gpu_env}{restart_cmd} 2>&1 | python3 -u -m underfit.utils.stderr_filter | tee {_q(log_path)}"
+        # Capture bash's own stderr (shell errors, source failures, etc.) — used by
+        # the run-monitor's diagnose helper to surface a hint when a run dies fast
+        # with an empty log.
+        bash_err_path = log_path + ".bash.err"
+        try:
+            bash_err_f = open(bash_err_path, "wb")
+        except OSError:
+            bash_err_f = subprocess.DEVNULL
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", launch_cmd],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=bash_err_f,
                 preexec_fn=os.setsid,
             )
         except Exception as e:
