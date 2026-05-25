@@ -183,11 +183,12 @@ def _arrow_select(title: str, lines_per_option: list[list[str]], default_idx: in
     n = len(lines_per_option)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         # Non-interactive fallback: print menu + accept a typed digit.
+        # Sub-descriptions indent under the label text (past the [N] marker).
         print(title)
         for i, opt in enumerate(lines_per_option, 1):
             print(f"  [{i}] {opt[0]}")
             for extra in opt[1:]:
-                print(f"      {extra}")
+                print(f"        {extra}")  # 8 spaces — clearly indented past '  [1] '
         try:
             ans = input(f"Choice [1-{n}, ↵ for {default_idx + 1}]: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -203,6 +204,12 @@ def _arrow_select(title: str, lines_per_option: list[list[str]], default_idx: in
     saved = termios.tcgetattr(fd)
     selected = default_idx
 
+    # ANSI codes for dim text on description lines (visually separates label
+    # from sub-description so the menu reads as N options not 2N options).
+    DIM = "\x1b[2;90m"  # faint + bright black
+    RESET = "\x1b[0m"
+    SUB_INDENT = "      "  # 6 spaces — clearly indented past the cursor marker
+
     def _render(first=False):
         if not first:
             total_lines = sum(len(opt) for opt in lines_per_option)
@@ -214,7 +221,7 @@ def _arrow_select(title: str, lines_per_option: list[list[str]], default_idx: in
             sys.stdout.write(f"{marker}{head}\n")
             for line in rest:
                 sys.stdout.write("\x1b[2K\r")
-                sys.stdout.write(f"   {line}\n")
+                sys.stdout.write(f"{SUB_INDENT}{DIM}{line}{RESET}\n")
         sys.stdout.flush()
 
     print(title)
