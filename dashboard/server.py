@@ -43,8 +43,13 @@ MODELS_SHIPPED_DIR = DASHBOARD_DIR / "models"   # per-model {registry.json, trai
 PRE_DIR = BASE_DIR / "dataset_processing"       # autotagger, pre_encode, metadata helpers
 
 # Per-instance runtime paths (under STATE_DIR)
-RUNS_DIR = STATE_DIR / "runs"                   # per-run checkpoints, logs, generated dataset configs
+RUNS_DIR = STATE_DIR / "runs"                   # per-run checkpoints, configs, demos — durable, on Drive in Colab
 SEED_LORAS_DIR = STATE_DIR / "seed_loras"       # user-uploaded LoRA seed checkpoints (validated, content-addressed)
+# Live training logs live on local SSD on Colab (fast reads for the dashboard)
+# and get rsync'd to Drive every ~60s by a separate thread in the notebook.
+# Outside Colab, defaults to RUNS_DIR so single-machine setups behave as before.
+LOGS_DIR = Path(os.environ.get("UNDERFIT_LOGS_DIR", str(RUNS_DIR))).expanduser()
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR = STATE_DIR / "audio"                 # generated demo MP3s + spectrogram JPGs
 
 # Base-model files (SA3 RF + ARC, T5Gemma) — defaults to STATE_DIR/models,
@@ -3402,7 +3407,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         save_dir = str(RUNS_DIR)
         mi = _get_model_info(base_model)
         base_model_config = mi["template"]
-        log_path = f"{save_dir}/{run_id}.log"
+        # Log lives on local SSD when UNDERFIT_LOGS_DIR is set (= Colab),
+        # otherwise falls back to RUNS_DIR (single-machine setups).
+        log_path = str(LOGS_DIR / f"{run_id}.log")
 
         # Generate per-run dataset config
         ds = datasets_registry.get_dataset(dataset_id)
@@ -3963,7 +3970,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         # Strip existing _resume_YYYYMMDDHHMMSS suffix to avoid nesting
         base_log_stem = re.sub(r"_resume_\d+$", "", orig_log.stem)
-        new_log = orig_log.parent / f"{base_log_stem}_resume_{timestamp}.log"
+        # Always put resume logs in LOGS_DIR (local SSD on Colab) so resuming
+        # an old run that originally wrote to Drive still gets fast logs.
+        new_log = LOGS_DIR / f"{base_log_stem}_resume_{timestamp}.log"
 
         # Launch — use GPU from request body if provided, else fall back to run's previous GPU
         gpu = body.get("gpu", run.get("gpu"))

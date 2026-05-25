@@ -403,6 +403,127 @@ def restart_dashboard_button(port: int = 8787) -> None:
     display(out)
 
 
+# ── Drive log sync ──────────────────────────────────────────────────────────
+# Training logs live on local SSD for fast dashboard reads. A background thread
+# in the notebook kernel periodically copies them to Drive for durability across
+# session resets. Single-singleton pattern: calling start_drive_log_sync again
+# stops the prior thread and starts a new one (lifecycle tied to dashboard
+# restart, which happens in the same launch cell).
+
+_log_sync_stop: "threading.Event | None" = None  # type: ignore[name-defined]
+_log_sync_thread = None  # threading.Thread
+
+
+def _sync_logs_local_to_drive(local_dir, drive_dir) -> int:
+    """One pass: copy each *.log* in local_dir to drive_dir when local is
+    newer. Returns the number of files actually copied."""
+    import shutil
+    from pathlib import Path
+    n = 0
+    if not Path(local_dir).exists() or not Path(drive_dir).exists():
+        return 0
+    for local_file in Path(local_dir).glob("*.log*"):
+        drive_file = Path(drive_dir) / local_file.name
+        try:
+            lmt = local_file.stat().st_mtime
+            dmt = drive_file.stat().st_mtime if drive_file.exists() else 0.0
+        except OSError:
+            continue
+        if lmt > dmt + 0.5:  # 0.5s slack to avoid clock-skew false-positives
+            try:
+                shutil.copy2(str(local_file), str(drive_file))
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def _seed_local_logs_from_drive(local_dir, drive_dir) -> int:
+    """Cold-start: copy each *.log* on Drive to local SSD if local is missing
+    or older. Lets the dashboard browse old-session logs at SSD speed and
+    keeps runs.json log_path references resolvable when paths from a prior
+    session still point at the Drive copy."""
+    import shutil
+    from pathlib import Path
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+    if not Path(drive_dir).exists():
+        return 0
+    n = 0
+    for drive_file in Path(drive_dir).glob("*.log*"):
+        local_file = Path(local_dir) / drive_file.name
+        try:
+            dmt = drive_file.stat().st_mtime
+            lmt = local_file.stat().st_mtime if local_file.exists() else 0.0
+        except OSError:
+            continue
+        if dmt > lmt + 0.5:
+            try:
+                shutil.copy2(str(drive_file), str(local_file))
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def start_drive_log_sync(
+    local_dir: str = "/content/underfit-logs",
+    drive_dir: str = "/content/drive/MyDrive/underfit-state/runs",
+    interval: int = 60,
+) -> None:
+    """Start a background thread that periodically copies live training logs
+    from `local_dir` (fast SSD writes) to `drive_dir` (durable across Colab
+    session resets).
+
+    Lifecycle: calling this function stops any prior sync thread first, so it
+    composes cleanly with `launch_dashboard_subprocess` — call it once after
+    every dashboard launch/restart.
+
+    On the very first call this session, also does a one-time Drive → local
+    seed so `runs.json` log_path fields written in prior sessions still
+    resolve when the dashboard reads them.
+
+    Runs in the *notebook* kernel (not the dashboard subprocess), so it
+    survives dashboard restarts and is independent of the Step 5 diagnostic
+    monitor (which the user can stop without affecting Drive backups).
+    """
+    import threading
+    global _log_sync_stop, _log_sync_thread
+
+    # Stop any prior sync first
+    if _log_sync_stop is not None:
+        _log_sync_stop.set()
+        if _log_sync_thread is not None:
+            _log_sync_thread.join(timeout=5)
+        _log_sync_stop = None
+        _log_sync_thread = None
+
+    # Cold-start seed (fast no-op if local already has the files)
+    seeded = _seed_local_logs_from_drive(local_dir, drive_dir)
+    if seeded:
+        print(f"[log-sync] seeded {seeded} log file(s) from Drive → {local_dir}", flush=True)
+
+    stop = threading.Event()
+
+    def _sync_loop():
+        # First sync runs after `interval` seconds — fresh local writes
+        # haven't accumulated yet, no rush.
+        while not stop.wait(interval):
+            try:
+                _sync_logs_local_to_drive(local_dir, drive_dir)
+            except Exception as e:
+                print(f"[log-sync] error: {type(e).__name__}: {e}", flush=True)
+
+    _log_sync_stop = stop
+    _log_sync_thread = threading.Thread(
+        target=_sync_loop, daemon=True, name="underfit-log-sync"
+    )
+    _log_sync_thread.start()
+    print(
+        f"[log-sync] running every {interval}s: {local_dir} → {drive_dir}",
+        flush=True,
+    )
+
+
 def launch_dashboard_subprocess(*, port: int = 8787,
                                 server_script: str = "dashboard/server.py",
                                 wait_for_ready: bool = True,
