@@ -403,6 +403,132 @@ def restart_dashboard_button(port: int = 8787) -> None:
     display(out)
 
 
+# ── Drive state-file sync ───────────────────────────────────────────────────
+# State JSON files (runs.json, datasets.json, gradio_*.json) live on local SSD
+# for fast dashboard reads/writes. This thread mirrors them to Drive every ~10s
+# so a Colab session reset doesn't lose dashboard state.
+#
+# Atomicity: server.py uses _atomic_write_json (tmp + os.replace). Sync reads
+# whole files via shutil.copy2 — between server's tmp-write and rename, the
+# real file is unchanged, so we never read torn JSON.
+
+_state_sync_stop: "threading.Event | None" = None  # type: ignore[name-defined]
+_state_sync_thread = None  # threading.Thread
+
+# State files we sync between local SSD and Drive. Anything not in this list
+# stays where it is (e.g. seed_loras/, runs/, datasets/, audio/).
+_STATE_FILE_NAMES = (
+    "runs.json",
+    "datasets.json",
+    "gradio_instances.json",
+    "gradio_vram_estimate.json",
+)
+
+
+def _atomic_copy(src, dst):
+    """shutil.copy2 → tmp + os.replace, so a reader on `dst` never sees a
+    half-copied file."""
+    import shutil
+    from pathlib import Path
+    dst = Path(dst)
+    tmp = dst.with_suffix(dst.suffix + ".sync.tmp")
+    try:
+        shutil.copy2(str(src), str(tmp))
+        os.replace(str(tmp), str(dst))
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _sync_state_files(src_dir, dst_dir) -> int:
+    """Copy each state file from src to dst when src is newer. Returns count
+    of files actually copied this pass."""
+    from pathlib import Path
+    n = 0
+    for name in _STATE_FILE_NAMES:
+        src = Path(src_dir) / name
+        if not src.exists():
+            continue
+        dst = Path(dst_dir) / name
+        try:
+            smt = src.stat().st_mtime
+            dmt = dst.stat().st_mtime if dst.exists() else 0.0
+        except OSError:
+            continue
+        if smt > dmt + 0.5:
+            try:
+                Path(dst_dir).mkdir(parents=True, exist_ok=True)
+                _atomic_copy(src, dst)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def start_drive_state_sync(
+    local_dir: str = "/content/underfit-state",
+    drive_dir: str = "/content/drive/MyDrive/underfit-state",
+    interval: int = 10,
+) -> None:
+    """Mirror state JSON files between SSD and Drive.
+
+    SYNCHRONOUS cold-start seed runs BEFORE this function returns — call this
+    in Cell 4 *before* `launch_dashboard_subprocess` so the dashboard's
+    RunsRegistry/_load can read a populated runs.json on startup.
+
+    After seeding, a daemon thread does Drive→local once (in case Drive has
+    newer state from another session) and then local→Drive every `interval`
+    seconds for the rest of the kernel's life.
+
+    Calling again stops the prior sync thread and starts fresh — composes
+    cleanly with `launch_dashboard_subprocess`'s restart pattern.
+    """
+    import threading
+    global _state_sync_stop, _state_sync_thread
+
+    # Stop any prior sync thread first
+    if _state_sync_stop is not None:
+        _state_sync_stop.set()
+        if _state_sync_thread is not None:
+            _state_sync_thread.join(timeout=5)
+        _state_sync_stop = None
+        _state_sync_thread = None
+
+    from pathlib import Path
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+    # --- SYNCHRONOUS COLD-START SEED ---
+    # Copy Drive → local for any state file where Drive is newer (or local is
+    # missing). Returns after seed completes — guarantees runs.json etc. are
+    # readable by the dashboard process when it starts up.
+    seeded = _sync_state_files(drive_dir, local_dir)
+    if seeded:
+        print(f"[state-sync] seeded {seeded} state file(s) from Drive → local SSD",
+              flush=True)
+
+    stop = threading.Event()
+
+    def _sync_loop():
+        while not stop.wait(interval):
+            try:
+                _sync_state_files(local_dir, drive_dir)
+            except Exception as e:
+                print(f"[state-sync] error: {type(e).__name__}: {e}", flush=True)
+
+    _state_sync_stop = stop
+    _state_sync_thread = threading.Thread(
+        target=_sync_loop, daemon=True, name="underfit-state-sync"
+    )
+    _state_sync_thread.start()
+    print(
+        f"[state-sync] running every {interval}s: {local_dir} ⇄ {drive_dir}",
+        flush=True,
+    )
+
+
 # ── Drive log sync ──────────────────────────────────────────────────────────
 # Training logs live on local SSD for fast dashboard reads. A background thread
 # in the notebook kernel periodically copies them to Drive for durability across

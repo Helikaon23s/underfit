@@ -50,6 +50,25 @@ SEED_LORAS_DIR = STATE_DIR / "seed_loras"       # user-uploaded LoRA seed checkp
 # Outside Colab, defaults to RUNS_DIR so single-machine setups behave as before.
 LOGS_DIR = Path(os.environ.get("UNDERFIT_LOGS_DIR", str(RUNS_DIR))).expanduser()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+# Small state files (runs.json, datasets.json, gradio_*.json) live here.
+# On Colab → /content/underfit-state (local SSD) for instant dashboard reads.
+# Outside Colab → defaults to STATE_DIR so non-Colab setups are unchanged.
+STATE_FILES_DIR = Path(os.environ.get("UNDERFIT_STATE_FILES_DIR", str(STATE_DIR))).expanduser()
+STATE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_write_json(path, data):
+    """Write JSON via tmp+rename so a concurrent reader (e.g. the Drive sync
+    thread in the notebook kernel) never sees a partial file. POSIX guarantees
+    os.replace is atomic."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(str(tmp), str(path))
 AUDIO_DIR = STATE_DIR / "audio"                 # generated demo MP3s + spectrogram JPGs
 
 # Base-model files (SA3 RF + ARC, T5Gemma) — defaults to STATE_DIR/models,
@@ -60,7 +79,7 @@ AUDIO_DIR = STATE_DIR / "audio"                 # generated demo MP3s + spectrog
 MODELS_DIR = Path(os.environ.get(
     "UNDERFIT_MODELS_DIR", STATE_DIR / "models"
 )).expanduser()
-RUNS_FILE = STATE_DIR / "runs.json"
+RUNS_FILE = STATE_FILES_DIR / "runs.json"
 PORT = int(os.environ.get("UNDERFIT_DASHBOARD_PORT", 8787))
 DEMO_STEPS = 50
 DEMO_CFG_SCALES = [7]
@@ -611,9 +630,7 @@ class RunsRegistry:
             self._save()
 
     def _save(self):
-        with open(self._path, "w") as f:
-            json.dump(self._runs, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(self._path, self._runs)
 
     def list_runs(self):
         with self._lock:
@@ -680,7 +697,7 @@ registry = RunsRegistry()
 # Dataset pre-encoding registry
 # ---------------------------------------------------------------------------
 
-DATASETS_FILE = STATE_DIR / "datasets.json"
+DATASETS_FILE = STATE_FILES_DIR / "datasets.json"
 DATASETS_DIR = STATE_DIR / "datasets"   # latents + tag caches per dataset
 
 
@@ -943,9 +960,7 @@ class DatasetsRegistry:
             pass
 
     def _save(self):
-        with open(self._path, "w") as f:
-            json.dump(self._datasets, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(self._path, self._datasets)
 
     def list_datasets(self):
         with self._lock:
@@ -1105,7 +1120,7 @@ def _build_dataset_files(input_dir, exclude_set=None):
 
 
 
-GRADIO_STATE_FILE = STATE_DIR / "gradio_instances.json"
+GRADIO_STATE_FILE = STATE_FILES_DIR / "gradio_instances.json"
 
 
 class GradioManager:
@@ -1130,9 +1145,7 @@ class GradioManager:
                     alive.append(item)
                 else:
                     print(f"[startup] Gradio instance PID {pid} ({item.get('title', '?')}) is dead — removing")
-            with open(GRADIO_STATE_FILE, "w") as f:
-                json.dump(alive, f, indent=2)
-                f.write("\n")
+            _atomic_write_json(GRADIO_STATE_FILE, alive)
         except Exception as e:
             print(f"[startup] Failed to clean stale gradio instances: {e}")
 
@@ -1153,9 +1166,7 @@ class GradioManager:
                         "log_path": inst.get("log_path"),
                         "started_at": inst.get("started_at"),
                     })
-            with open(GRADIO_STATE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
+            _atomic_write_json(GRADIO_STATE_FILE, data)
         except Exception as e:
             print(f"[gradio] Failed to persist state: {e}")
 
@@ -2294,7 +2305,7 @@ def _query_gpu_compute_caps() -> dict:
     return caps
 
 # Gradio VRAM estimation
-GRADIO_VRAM_FILE = STATE_DIR / "gradio_vram_estimate.json"
+GRADIO_VRAM_FILE = STATE_FILES_DIR / "gradio_vram_estimate.json"
 _gradio_vram_lock = threading.Lock()
 _gradio_vram = {"load_mb": 10000, "peak_mb": 12000, "n_samples": 0}
 _gradio_vram_baselines = {}  # instance_id -> {"gpu": int, "before_mb": int, "measured": bool}
@@ -2312,9 +2323,7 @@ def _load_gradio_vram_estimate():
 
 def _save_gradio_vram_estimate():
     try:
-        with open(GRADIO_VRAM_FILE, "w") as f:
-            json.dump(_gradio_vram, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(GRADIO_VRAM_FILE, _gradio_vram)
     except Exception:
         pass
 
