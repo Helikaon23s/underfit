@@ -358,50 +358,37 @@ def dashboard_button(url: str | None = None,
 
 
 def restart_dashboard_button(port: int = 8787) -> None:
-    """Render a 'Restart Dashboard' button + note, sized to sit under the Open button.
+    """Render a note telling the user to restart the dashboard by re-running
+    this cell.
 
-    Clicking it kills any process bound to `port` and re-launches dashboard/server.py.
-    Training runs are unaffected — they're separate detached processes managed by
-    RunsRegistry, and the fresh dashboard re-reads their state from runs.json on startup.
+    Previously a button, but Colab queues button callbacks behind any
+    currently-running cell (e.g. the Step 5 monitor), so the button often
+    appeared dead until the user stopped the monitor first. Re-running this
+    cell calls launch_dashboard_subprocess again, which kills any existing
+    process on `port` and starts a fresh one. Training runs are unaffected —
+    they're separate detached processes managed by RunsRegistry.
+
+    `port` is accepted for API compatibility with the previous button-version
+    callers but is unused — the actual restart now happens via cell re-run.
     """
+    del port  # unused; kept for back-compat
     try:
-        import ipywidgets as widgets
         from IPython.display import display, HTML
     except ImportError:
         return None
 
-    btn = widgets.Button(
-        description="🔄 Restart Dashboard",
-        button_style="warning",
-        layout=widgets.Layout(width="240px", height="40px"),
-    )
-    out = widgets.Output()
-
-    def _on_click(b):
-        b.disabled = True
-        b.description = "Restarting…"
-        with out:
-            try:
-                launch_dashboard_subprocess(port=port, quiet=True)
-                print(f"✓ Dashboard restarted on port {port} "
-                      f"(training runs unaffected).", flush=True)
-            except Exception as e:
-                print(f"✗ Restart failed: {type(e).__name__}: {e}", flush=True)
-            finally:
-                b.disabled = False
-                b.description = "🔄 Restart Dashboard"
-
-    btn.on_click(_on_click)
-
-    display(widgets.HBox([btn], layout=widgets.Layout(justify_content="center")))
     display(HTML(
-        "<div style='text-align:center; font-size:12px; color:#888; "
-        "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif; "
-        "margin: 2px 0 18px 0;'>"
+        "<div style='text-align:center;"
+        "font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif;"
+        "margin:8px 0 18px 0;'>"
+        "<div style='font-size:16px;font-weight:600;color:var(--colab-primary-text-color,#444)'>"
+        "Restart dashboard by restarting this cell."
+        "</div>"
+        "<div style='font-size:12px;color:var(--colab-secondary-text-color,#888);margin-top:4px'>"
         "* doesn't affect training runs. Do this if dashboard freezes."
         "</div>"
+        "</div>"
     ))
-    display(out)
 
 
 # ── Drive state-file sync ───────────────────────────────────────────────────
