@@ -1504,27 +1504,6 @@
         <label class="modal-label" id="ds-default-prompt-label">Default prompt (for files without tags)</label>
         <input type="text" class="resume-input" id="ds-default-prompt" placeholder="Genre: ..." value="">
       </div>
-      <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.9em">
-          <input type="checkbox" id="ds-split-enable" style="margin:0">
-          Split audio longer than
-        </label>
-        <select class="modal-select" id="ds-split-threshold" style="padding:4px 8px;width:auto">
-          <option value="20">20s</option>
-          <option value="30">30s</option>
-          <option value="60">60s</option>
-          <option value="90">90s</option>
-          <option value="120">2m</option>
-          <option value="180">3m</option>
-          <option value="240">4m</option>
-          <option value="300">5m</option>
-          <option value="360" selected>6m</option>
-          <option value="420">7m</option>
-          <option value="600">10m</option>
-          <option value="900">15m</option>
-        </select>
-        <span style="color:var(--text2);font-size:0.78em">into equal chunks ≤ threshold</span>
-      </div>
       <div class="resume-error" id="ds-encode-error"></div>
       <div class="modal-actions" style="margin-top:12px">
         <button class="modal-cancel" onclick="dsBackToStep1()">Back</button>
@@ -5786,12 +5765,8 @@ window.filterNewFtDatasets = function() {
   for (const ds of compatible) {
     const opt = document.createElement('option');
     opt.value = ds.id;
-    // Show "1 file → 17 chunks" when split was used; just "N files" otherwise.
-    const _chunks = ds.num_chunks || ds.num_files;
-    const _filesLabel = (ds.num_files && _chunks && _chunks !== ds.num_files)
-      ? `${ds.num_files} file${ds.num_files === 1 ? '' : 's'} → ${_chunks} chunks`
-      : `${_chunks} files`;
-    opt.textContent = `${ds.name} (${_filesLabel})`;
+    const _n = ds.num_files || ds.num_chunks || 0;  // num_chunks fallback for legacy datasets
+    opt.textContent = `${ds.name} (${_n} file${_n === 1 ? '' : 's'})`;
     dsSel.appendChild(opt);
   }
   // Restore previous selection if still in the list
@@ -7063,14 +7038,8 @@ window.dsxShowList = async function() {
       const statusCls = ds.status === 'ready' ? 'ready' : ds.status === 'encoding' ? 'encoding' : 'error';
       const _dsModelLabel = (m) => { const shared = {'sao':'SAO / SAO-small'}; return shared[m] || (m||'?').toUpperCase(); };
       const modelTag = ds.model ? `<span style="color:var(--accent2)">${_dsModelLabel(ds.model)}</span>` : '';
-      // "1 file \u2192 17 chunks" when split was used; just "N files" otherwise.
-      const _chunks = ds.num_chunks || ds.num_files;
-      let _filesLabel = '';
-      if (ds.num_files && _chunks && _chunks !== ds.num_files) {
-        _filesLabel = `${ds.num_files} file${ds.num_files === 1 ? '' : 's'} \u2192 ${_chunks} chunks`;
-      } else if (_chunks) {
-        _filesLabel = `${_chunks} file${_chunks === 1 ? '' : 's'}`;
-      }
+      const _n = ds.num_files || ds.num_chunks || 0;
+      const _filesLabel = _n ? `${_n} file${_n === 1 ? '' : 's'}` : '';
       const meta = [modelTag, _filesLabel, ds.latent_dir || ''].filter(Boolean).join(' \u00b7 ');
       html += `<div class="dsx-card" onclick="dsxShowDetail('${ds.id}')">` +
         `<button class="dsx-delete" onclick="dsxDeleteDataset('${ds.id}',event)">Delete</button>` +
@@ -7105,17 +7074,7 @@ window.dsxShowDetail = async function(dsId) {
     const statusCls = ds.status === 'ready' ? 'ready' : ds.status === 'encoding' ? 'encoding' : 'error';
     const _dsModelLabel2 = (m) => { const shared = {'sao':'SAO / SAO-small'}; return shared[m] || (m||'?').toUpperCase(); };
     let info = `<span class="dsx-status ${statusCls}">${ds.status}</span> &nbsp; <span style="color:var(--accent2)">${_dsModelLabel2(ds.model)}</span>`;
-    // Show "N source files → M chunks" when split-on-encode produced more
-    // latents than source files; otherwise just "N total".
-    const _srcCount = data.total_files;
-    const _chunkCount = (ds && ds.num_chunks) ? ds.num_chunks : _srcCount;
-    let _filesLine;
-    if (_chunkCount && _srcCount && _chunkCount !== _srcCount) {
-      _filesLine = `${_srcCount} source file${_srcCount === 1 ? '' : 's'} → ${_chunkCount} chunks`;
-    } else {
-      _filesLine = `${_srcCount} total`;
-    }
-    info += `<br>Files: ${_filesLine} (${data.files_with_tags} with tags)`;
+    info += `<br>Files: ${data.total_files} total (${data.files_with_tags} with tags)`;
     if (ds.input_dir) info += `<br>Input: <span style="color:var(--text2)">${ds.input_dir}</span>`;
     if (ds.latent_dir) info += `<br>Latents: <span style="color:var(--text2)">${ds.latent_dir}</span>`;
     const dpVal = ds.default_prompt || '';
@@ -7269,16 +7228,11 @@ window.launchEncoding = async function() {
   loadingEl.style.display = 'flex';
   document.getElementById('ds-modal').onclick = null; // prevent close during load
   try {
-    const splitEnabled = document.getElementById('ds-split-enable').checked;
-    const splitVal = splitEnabled
-      ? parseInt(document.getElementById('ds-split-threshold').value, 10)
-      : null;
     const res = await fetch('/api/datasets/encode', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name, input_dir: _dsScanResult.path, model, gpus, half: true,
         default_prompt: (document.getElementById('ds-default-prompt').value || '').trim(),
-        split_max_duration: splitVal,
         exclude: _dsScanResult.audio_files
           .filter((f, i) => !_dsFileIncluded[i])
           .map(f => f.relpath)

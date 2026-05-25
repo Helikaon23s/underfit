@@ -219,15 +219,9 @@ def extract_tags(filepath):
 # Worker: encode one shard of files on one GPU
 # ---------------------------------------------------------------------------
 
-def _load_and_prepare(fpath, sample_rate, audio_channels, max_samples, device, half,
-                      slice_start=None, slice_end=None):
-    """Load one audio file, optionally slice to [slice_start:slice_end] (in TARGET-sr
-    samples), then crop/pad to max_samples. Returns (audio, actual_samples)."""
+def _load_and_prepare(fpath, sample_rate, audio_channels, max_samples, device, half):
+    """Load one audio file, crop/pad to max_samples. Returns (audio, actual_samples)."""
     audio = load_audio(fpath, sample_rate, audio_channels, device)
-    if slice_start is not None or slice_end is not None:
-        s = slice_start or 0
-        e = slice_end if slice_end is not None else audio.shape[-1]
-        audio = audio[:, s:e]
     actual_samples = audio.shape[-1]
     if actual_samples > max_samples:
         audio = audio[:, :max_samples]
@@ -239,22 +233,12 @@ def _load_and_prepare(fpath, sample_rate, audio_channels, max_samples, device, h
     return audio, actual_samples
 
 
-def _expand_files_to_tasks(audio_files, input_dir, split_max_duration, sample_rate):
-    """Expand a list of file paths into a list of encoding tasks. When
-    `split_max_duration` (seconds) is None or 0, each file becomes one task.
-    Otherwise, files longer than the threshold get split into the smallest
-    number of equal-sized chunks each ≤ the threshold.
-
-    Each task is a dict:
-        path:         absolute source file path
-        src_rel:      relative path under input_dir (for logging)
-        out_rel:      relative output path with chunk suffix if split (".npy" stem)
-        slice_start:  None (whole file) or starting sample index (target sr)
-        slice_end:    None (whole file) or ending sample index (target sr)
-        chunk_idx:    None or 1-based chunk number
-        chunk_total:  None or number of chunks for this source file
+def _expand_files_to_tasks(audio_files, input_dir):
+    """One task per audio file (no splitting). Returns a list of dicts:
+        path:    absolute source file path
+        src_rel: relative path under input_dir (for logging)
+        out_rel: relative output path with .npy suffix
     """
-    import math
     tasks = []
     for fpath in audio_files:
         fpath = Path(fpath)
@@ -263,55 +247,8 @@ def _expand_files_to_tasks(audio_files, input_dir, split_max_duration, sample_ra
         except ValueError:
             rel = Path(fpath.name)
         npy_rel = rel.with_suffix(".npy")
-
-        if not split_max_duration or split_max_duration <= 0:
-            tasks.append({"path": str(fpath), "src_rel": str(rel),
-                          "out_rel": str(npy_rel),
-                          "slice_start": None, "slice_end": None,
-                          "chunk_idx": None, "chunk_total": None})
-            continue
-
-        # Probe duration cheaply via torchaudio.info (reads header only).
-        try:
-            info = torchaudio.info(str(fpath))
-            file_sr = info.sample_rate
-            file_total = info.num_frames
-            duration_s = file_total / file_sr
-        except Exception:
-            tasks.append({"path": str(fpath), "src_rel": str(rel),
-                          "out_rel": str(npy_rel),
-                          "slice_start": None, "slice_end": None,
-                          "chunk_idx": None, "chunk_total": None})
-            continue
-
-        if duration_s <= split_max_duration + 1e-6:
-            tasks.append({"path": str(fpath), "src_rel": str(rel),
-                          "out_rel": str(npy_rel),
-                          "slice_start": None, "slice_end": None,
-                          "chunk_idx": None, "chunk_total": None})
-            continue
-
-        # Split into the smallest number of equal-sized chunks each ≤ threshold.
-        num_chunks = math.ceil(duration_s / split_max_duration)
-        # Total samples at the TARGET sample rate (where slicing happens after resampling)
-        total_target_samples = int(round(duration_s * sample_rate))
-        boundaries = [int(round(i * total_target_samples / num_chunks))
-                      for i in range(num_chunks + 1)]
-
-        # Output naming: <stem>__chunk_NNN_of_MMM.npy
-        for i in range(num_chunks):
-            s, e = boundaries[i], boundaries[i + 1]
-            chunk_label = f"chunk_{i+1:03d}_of_{num_chunks:03d}"
-            chunk_rel = npy_rel.with_stem(npy_rel.stem + f"__{chunk_label}")
-            tasks.append({
-                "path": str(fpath),
-                "src_rel": str(rel),
-                "out_rel": str(chunk_rel),
-                "slice_start": s,
-                "slice_end": e,
-                "chunk_idx": i + 1,
-                "chunk_total": num_chunks,
-            })
+        tasks.append({"path": str(fpath), "src_rel": str(rel),
+                      "out_rel": str(npy_rel)})
     return tasks
 
 
@@ -418,9 +355,7 @@ def _encode_shard_inner(rank, world_size, cfg):
             src_rel = Path(task["src_rel"])
             try:
                 audio, actual_samples = _load_and_prepare(
-                    fpath, sample_rate, audio_channels, max_samples, device, cfg["half"],
-                    slice_start=task.get("slice_start"),
-                    slice_end=task.get("slice_end"))
+                    fpath, sample_rate, audio_channels, max_samples, device, cfg["half"])
                 b_audio.append(audio)
                 b_meta.append((global_idx, fpath, task, actual_samples))
             except Exception as e:
@@ -489,21 +424,16 @@ def _encode_shard_inner(rank, world_size, cfg):
                     np.save(str(npy_path), latent_np)
 
                     tags = extract_tags(fpath)
-                    seconds_start = (task["slice_start"] or 0) / sample_rate \
-                        if task.get("slice_start") is not None else 0
                     meta = {
                         "path": str(fpath),
                         "relpath": str(out_rel),
                         "src_relpath": task["src_rel"],
                         "seconds_total": round(duration, 3),
-                        "seconds_start": round(seconds_start, 3),
+                        "seconds_start": 0,
                         "audio_samples": actual_samples,
                         "latent_shape": list(latent_np.shape),
                         "padding_mask": pm.int().tolist(),
                     }
-                    if task.get("chunk_idx") is not None:
-                        meta["chunk_index"] = task["chunk_idx"]
-                        meta["chunk_total"] = task["chunk_total"]
                     meta.update(tags)
                     with open(json_path, "w") as f:
                         json.dump(meta, f)
@@ -525,9 +455,7 @@ def _encode_shard_inner(rank, world_size, cfg):
                 out_rel = Path(task["out_rel"])
                 try:
                     audio, actual_samples = _load_and_prepare(
-                        fpath, sample_rate, audio_channels, max_samples, device, cfg["half"],
-                        slice_start=task.get("slice_start"),
-                        slice_end=task.get("slice_end"))
+                        fpath, sample_rate, audio_channels, max_samples, device, cfg["half"])
                     with torch.no_grad():
                         latent = pretransform.model.encode_audio(
                             audio.unsqueeze(0), chunked=use_chunked)
@@ -547,21 +475,16 @@ def _encode_shard_inner(rank, world_size, cfg):
                     np.save(str(npy_path), latent_np)
 
                     tags = extract_tags(fpath)
-                    seconds_start = (task["slice_start"] or 0) / sample_rate \
-                        if task.get("slice_start") is not None else 0
                     meta = {
                         "path": str(fpath),
                         "relpath": str(out_rel),
                         "src_relpath": task["src_rel"],
                         "seconds_total": round(duration, 3),
-                        "seconds_start": round(seconds_start, 3),
+                        "seconds_start": 0,
                         "audio_samples": actual_samples,
                         "latent_shape": list(latent_np.shape),
                         "padding_mask": pm.int().tolist(),
                     }
-                    if task.get("chunk_idx") is not None:
-                        meta["chunk_index"] = task["chunk_idx"]
-                        meta["chunk_total"] = task["chunk_total"]
                     meta.update(tags)
                     with open(json_path, "w") as f:
                         json.dump(meta, f)
@@ -620,11 +543,6 @@ def main():
                         help="Batch size per GPU (0=auto based on VRAM, default: 0)")
     parser.add_argument("--exclude-file", type=str, default=None,
                         help="Path to text file with relpaths to exclude (one per line)")
-    parser.add_argument("--split-max-duration", type=float, default=None,
-                        help=("If set, split audio files longer than N seconds into "
-                              "the smallest number of equal-sized chunks each ≤ N "
-                              "(e.g. 8min @ N=360 → 2x4min chunks). Tag metadata is "
-                              "copied to every chunk. Off by default."))
     args = parser.parse_args()
 
     # --- Interactive fallbacks ------------------------------------------------
@@ -795,17 +713,8 @@ def main():
     print(f"  Batch size:         {batch_size} per GPU")
     print()
 
-    # --- Expand files → tasks (one task per file, OR one per chunk if split) ---
-    tasks = _expand_files_to_tasks(
-        audio_files, input_dir,
-        split_max_duration=args.split_max_duration,
-        sample_rate=sample_rate,
-    )
-    n_split = sum(1 for t in tasks if t.get("chunk_idx") is not None)
-    n_uniq_sources = len({t["src_rel"] for t in tasks})
-    if n_split:
-        print(f"  Split: {n_split} chunks from {n_uniq_sources - (len(tasks) - n_split)} long file(s) "
-              f"(threshold {args.split_max_duration:.0f}s)")
+    # --- Expand files → tasks (one task per file) ---
+    tasks = _expand_files_to_tasks(audio_files, input_dir)
     print(f"  Total encoding tasks: {len(tasks)}")
     print()
 

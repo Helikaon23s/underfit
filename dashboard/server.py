@@ -2035,27 +2035,20 @@ class EncodingMonitor:
                             try:
                                 with open(details_path) as f:
                                     details = json.load(f)
-                                # num_chunks = count of encoded .npy files (= chunks when
-                                # split is enabled, or = sources when it isn't).
-                                # num_files stays as the count of SOURCE audio files —
-                                # don't overwrite it here.
-                                num_chunks = sum(1 for _ in latent_dir.rglob("*.npy"))
-                                source_files = ds.get("num_files", num_chunks)
-                                total = ds.get("encoding_progress", {}).get("total", num_chunks)
+                                # 1 source audio file → 1 latent .npy (splitting is no
+                                # longer supported, so source count == latent count).
+                                num_files = sum(1 for _ in latent_dir.rglob("*.npy"))
+                                total = ds.get("encoding_progress", {}).get("total", num_files)
                                 self._registry.update_dataset(ds_id,
                                     status="ready",
                                     encoding_pid=None,
-                                    num_chunks=num_chunks,
+                                    num_files=num_files,
                                     latent_dim=details.get("latent_dim", 64),
                                     sample_rate=details.get("sample_rate", 44100),
                                     details=details,
-                                    encoding_progress={"encoded": num_chunks, "skipped": 0, "errors": 0, "total": total},
+                                    encoding_progress={"encoded": num_files, "skipped": 0, "errors": 0, "total": total},
                                 )
-                                if num_chunks != source_files:
-                                    print(f"[encoding_monitor] Dataset '{ds_id}' completed: "
-                                          f"{source_files} source files → {num_chunks} chunks")
-                                else:
-                                    print(f"[encoding_monitor] Dataset '{ds_id}' completed: {num_chunks} files")
+                                print(f"[encoding_monitor] Dataset '{ds_id}' completed: {num_files} files")
                                 # Regenerate GT if missing (normally already created at dataset creation)
                                 if not ds.get("ground_truth"):
                                     _ds_files = ds.get("dataset_files", [])
@@ -2091,11 +2084,10 @@ def _validate_datasets_on_startup():
                 datasets_registry.update_dataset(ds["id"], status="error")
                 print(f"[startup] Dataset '{ds['id']}' latent dir missing — marked error")
             else:
-                # Re-count .npy chunks on disk. Don't overwrite num_files
-                # (that's the SOURCE-file count, fixed at dataset creation).
-                num_chunks = sum(1 for _ in latent_dir.rglob("*.npy"))
-                if num_chunks != ds.get("num_chunks", 0):
-                    datasets_registry.update_dataset(ds["id"], num_chunks=num_chunks)
+                # Re-count .npy files on disk and update num_files.
+                num_files = sum(1 for _ in latent_dir.rglob("*.npy"))
+                if num_files != ds.get("num_files", 0):
+                    datasets_registry.update_dataset(ds["id"], num_files=num_files)
         elif ds["status"] == "encoding":
             # Check if encoding PID is still alive
             pid = ds.get("encoding_pid")
@@ -2103,8 +2095,8 @@ def _validate_datasets_on_startup():
                 latent_dir = Path(ds.get("latent_dir", ""))
                 details_path = latent_dir / "details.json"
                 if details_path.exists():
-                    num_chunks = sum(1 for _ in latent_dir.rglob("*.npy"))
-                    datasets_registry.update_dataset(ds["id"], status="ready", encoding_pid=None, num_chunks=num_chunks)
+                    num_files = sum(1 for _ in latent_dir.rglob("*.npy"))
+                    datasets_registry.update_dataset(ds["id"], status="ready", encoding_pid=None, num_files=num_files)
                     print(f"[startup] Dataset '{ds['id']}' encoding finished (PID dead, details exists)")
                 else:
                     datasets_registry.update_dataset(ds["id"], status="error", encoding_pid=None)
@@ -4887,13 +4879,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         half = body.get("half", True)
         default_prompt = body.get("default_prompt", "").strip()
         exclude_list = body.get("exclude", [])
-        # Optional: split audio longer than this many seconds into equal chunks.
-        # None / 0 / missing → no split.
-        split_max_duration = body.get("split_max_duration")
-        try:
-            split_max_duration = float(split_max_duration) if split_max_duration else None
-        except (TypeError, ValueError):
-            split_max_duration = None
         if not name or not input_dir:
             self._json_response({"error": "name and input_dir required"}, status=400)
             return
@@ -4953,8 +4938,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             exclude_file.write_text("\n".join(sorted(exclude_set)) + "\n")
             exclude_flag = f" --exclude-file {shlex.quote(str(exclude_file))}"
 
-        split_flag = f" --split-max-duration {split_max_duration:g}" if split_max_duration else ""
-
         _q = shlex.quote
         cmd = (
             f"source {VENV_ACTIVATE} && "
@@ -4964,7 +4947,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             f"--model {_q(model)} "
             f"--output-dir {_q(str(output_dir))} "
             f"--num-gpus {len(gpus)}"
-            f"{half_flag}{exclude_flag}{split_flag} "
+            f"{half_flag}{exclude_flag} "
             f"2>&1 | python3 -u -m underfit.utils.stderr_filter | tee {_q(str(log_path))}"
         )
         try:
