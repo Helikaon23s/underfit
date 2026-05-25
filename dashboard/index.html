@@ -5381,12 +5381,8 @@ window._warnUnregisteredModel = function(modelKey) {
     +   ` isn’t available on this machine yet.`
     + `</div>`
     + `<div style="padding:10px 14px;background:var(--bg3);border-radius:6px;`
-    +     `border-left:3px solid var(--orange)">`
-    +   `<div style="font-size:0.82em;color:var(--text2);margin-bottom:4px">`
-    +     `Run this in your underfit directory to download it:`
-    +   `</div>`
-    +   `<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;`
-    +     `color:var(--accent2);font-size:0.98em;font-weight:600">./install.sh</div>`
+    +     `border-left:3px solid var(--orange);color:var(--text);font-size:0.92em">`
+    +   `Please run the installer again to download it.`
     + `</div>`;
   _showSeedDialog(titleHtml, bodyHtml, [{label: 'OK', primary: true}]);
 };
@@ -6016,7 +6012,7 @@ window.validateNewFt = function() {
   let error = '';
   if (_newFtNoDatasets) error = 'Create a dataset first';
   else if (baseModelKey && baseModelMeta.registered === false)
-    error = `Base model "${baseModelMeta.label || baseModelKey}" not downloaded — run ./install.sh`;
+    error = `Base model "${baseModelMeta.label || baseModelKey}" not downloaded — please run installer again`;
   else if (!name) error = '_name_empty';
   else if (runsData.some(r => r.display_name === name)) error = `Run "${name}" already exists`;
   else if (isNaN(steps) || steps < 100) error = 'Steps must be >= 100';
@@ -7450,7 +7446,7 @@ window.validateNewDataset = function() {
   const errEl = document.getElementById('ds-encode-error');
   const btn = document.getElementById('ds-encode-btn');
   if (modelKey && modelMeta.registered === false) {
-    errEl.textContent = `Base model "${modelMeta.label || modelKey}" not downloaded — run ./install.sh`;
+    errEl.textContent = `Base model "${modelMeta.label || modelKey}" not downloaded — please run installer again`;
     btn.disabled = true;
   } else {
     if (errEl.textContent.includes('not downloaded')) errEl.textContent = '';
@@ -7465,7 +7461,7 @@ window.launchEncoding = async function() {
   const gpus = Array.from(_dsSelectedGpus).sort();
   const errEl = document.getElementById('ds-encode-error');
   if (model && modelMeta.registered === false) {
-    errEl.textContent = `Base model "${modelMeta.label || model}" not downloaded — run ./install.sh`;
+    errEl.textContent = `Base model "${modelMeta.label || model}" not downloaded — please run installer again`;
     return;
   }
   if (!name) { errEl.textContent = 'Name required'; return; }
