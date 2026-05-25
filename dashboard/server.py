@@ -387,7 +387,18 @@ def _diagnose_quick_kill(run: dict) -> str | None:
         except OSError:
             pass
 
-    # 3. Quick death with empty log → OOM-killer heuristic
+    # 3. Did lora_train.py even reach __main__?
+    started_path = log_path + ".started"
+    reached_python = os.path.exists(started_path)
+    if log_path and not reached_python:
+        # No marker means bash died before python ran. Most likely: bad venv path,
+        # source failure, missing executable, or shell-quoting bug. Should already
+        # have shown up in .bash.err above, but if not, this is the next-best clue.
+        return ("Process never reached python (no '.started' marker) — bash / "
+                "venv / source failed silently. Inspect <log>.bash.err if it "
+                "exists, or try the run's restart_cmd manually.")
+
+    # 4. Quick death with empty log → OOM-killer heuristic
     elapsed = None
     try:
         ts = run.get("created_at", "")

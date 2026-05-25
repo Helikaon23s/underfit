@@ -6,15 +6,8 @@ backend-agnostic (sat_dev or sa3) and lives in underfit/training/loop.py.
 """
 import os
 import sys
+import time
 import traceback
-print(f"Starting {os.path.basename(__file__)}...", flush=True)
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-import argparse
-import configparser
-
-from underfit.backends import get_backend
-from underfit.training import run_training
 
 
 def _dump_exit_reason(exc):
@@ -37,6 +30,43 @@ def _dump_exit_reason(exc):
         sys.stderr.flush()
     except Exception:
         pass
+
+
+# Install excepthook BEFORE the rest of the imports so module-level failures
+# (e.g. `from underfit.backends import get_backend` blowing up) still trigger
+# the .exit sidecar dump. Without this, an ImportError during the imports
+# below would bypass the try/except in __main__.
+def _excepthook(exc_type, exc, tb):
+    _dump_exit_reason(exc)
+    # Let the default hook also print to stderr (best-effort).
+    try:
+        sys.__excepthook__(exc_type, exc, tb)
+    except Exception:
+        pass
+
+
+sys.excepthook = _excepthook
+
+# Write a 'got to python' marker so the diagnose helper can tell whether
+# the failure was before python even ran (bash / venv / source issue) or
+# after (python-side: ImportError, CUDA, etc.).
+_log_for_marker = os.environ.get("UNDERFIT_LOG_PATH") or "lora_train.log"
+try:
+    with open(_log_for_marker + ".started", "w") as _f:
+        _f.write(f"lora_train.py reached __main__ at {time.time()}\n")
+        _f.write(f"cwd: {os.getcwd()}\n")
+        _f.write(f"python: {sys.executable}\n")
+except Exception:
+    pass
+
+print(f"Starting {os.path.basename(__file__)}...", flush=True)
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+import argparse
+import configparser
+
+from underfit.backends import get_backend
+from underfit.training import run_training
 
 
 def get_all_args(defaults_file="defaults.ini"):
