@@ -1278,7 +1278,7 @@
            filename + a [clear] link that brings the button back. -->
       <div style="display:flex;gap:8px;align-items:center;margin:8px 0 4px 0;min-height:30px">
         <button type="button" class="modal-cancel" id="new-ft-lora-load-btn"
-                onclick="document.getElementById('new-ft-seed-file').click()"
+                onclick="_pickSeedLoraFile()"
                 style="padding:4px 14px;font-size:0.85em">📂 Start from a previous LoRA</button>
         <span id="new-ft-seed-status" style="color:var(--text2);font-size:0.78em"></span>
         <input type="file" id="new-ft-seed-file" accept=".safetensors" style="display:none"
@@ -5331,6 +5331,15 @@ function _escAttr(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Open the file picker for the seed-LoRA upload. Always clear the input's
+// value first — otherwise re-picking the same file (after Cancel) doesn't
+// re-fire the change event and the picker appears to do nothing.
+window._pickSeedLoraFile = function() {
+  const inp = document.getElementById('new-ft-seed-file');
+  inp.value = '';
+  inp.click();
+};
+
 function _clearSeedLora() {
   document.getElementById('new-ft-seed-path').value = '';
   document.getElementById('new-ft-seed-filename').value = '';
@@ -5346,7 +5355,12 @@ window.handleSeedLoraFile = async function(ev) {
   const file = ev.target.files && ev.target.files[0];
   if (!file) return;
   if (!file.name.toLowerCase().endsWith('.safetensors')) {
-    alert('Only .safetensors files are accepted.\n.ckpt / .pt files use pickle and are a security risk.');
+    _showSeedDialog(
+      'Unsupported file type',
+      `Only <code>.safetensors</code> files are accepted.<br><br>`
+      + `<code>.ckpt</code> / <code>.pt</code> files use Python pickle, which is a `
+      + `remote-code-execution risk. Convert your checkpoint first.`,
+      [{label: 'Close'}]);
     return;
   }
   const sizeMb = (file.size / 1e6).toFixed(1);
@@ -5383,7 +5397,10 @@ window.handleSeedLoraFile = async function(ev) {
     _updateSeedUploadModal(100, 'validating…');
   } catch (e) {
     _hideSeedUploadModal();
-    alert('Upload failed: ' + e.message);
+    _showSeedDialog(
+      'Upload failed',
+      `<div style="color:var(--red)">${_escAttr(e.message)}</div>`,
+      [{label: 'Close'}]);
     return;
   }
   _hideSeedUploadModal();
