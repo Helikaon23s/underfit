@@ -304,17 +304,45 @@ def create_dataloader(dataset_config, batch_size, sample_size, sample_rate,
             f"sa3 backend does not support dataset_type={dataset_type!r} yet"
         )
 
+    # Oversample with replacement when the dataset is smaller than the
+    # requested batch_size. Without this, a 1-file / 8-batch run would
+    # yield one short batch per epoch (effective batch size = 1). With
+    # replacement sampling and random_crop=True, each draw is a fresh
+    # random latent-window from the same source file, so every batch is
+    # the full requested size and we get real augmentation from the
+    # tiny source set. Standard pattern for overfitting tiny datasets,
+    # which is the entire point of underfit.
+    n_ds = len(ds)
+    sampler = None
+    loader_shuffle = shuffle
+    if n_ds < batch_size:
+        # Aim for ~100 iters per epoch so logging/LR-schedule pacing
+        # don't go wild on a 1-file dataset.
+        samples_per_epoch = batch_size * 100
+        sampler = torch.utils.data.RandomSampler(
+            ds, replacement=True, num_samples=samples_per_epoch,
+        )
+        loader_shuffle = False  # PyTorch: shuffle and sampler are mutually exclusive
+        rc = dataset_config.get("random_crop", False)
+        print(
+            f"Dataset has {n_ds} file{'s' if n_ds != 1 else ''} < batch_size {batch_size}; "
+            f"oversampling with replacement → {samples_per_epoch} samples/epoch "
+            f"({samples_per_epoch // batch_size} iters/epoch)"
+            + ("" if rc else "  (tip: enable random_crop for real augmentation)"),
+            flush=True,
+        )
+
     return torch.utils.data.DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=loader_shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collation_fn,
-        # underfit is for small-dataset LoRA finetuning — single GPU, no
-        # BatchNorm, step count driven by --max-steps not steps-per-epoch.
-        # The upstream default of drop_last=True silently drops every
-        # batch when num_files < batch_size (e.g. 1-track datasets ->
-        # 0 iterations per epoch), which is the opposite of what we want.
+        # drop_last=False so a small final batch isn't silently dropped.
+        # With oversampling above, every batch is already the full size
+        # anyway; this matters only when len(ds) % batch_size != 0 in the
+        # normal (no-replacement) regime.
         drop_last=False,
     )
 
