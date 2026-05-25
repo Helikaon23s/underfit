@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """Training dashboard server for LoRA finetuning runs."""
 
-import json
 import os
+import sys
+
+# Put the underfit project root (parent of dashboard/) on sys.path so handlers
+# that lazy-import from `underfit.*` work regardless of how the script was
+# launched (`python dashboard/server.py`, uvicorn-style, etc.). The package
+# isn't installed in the venv (`package = false` in pyproject.toml), so we
+# can't rely on site-packages resolution.
+_DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_DASHBOARD_DIR)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import json
 import random
 import re
 import shlex
