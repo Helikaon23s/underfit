@@ -1236,7 +1236,7 @@
         </div>
         <div>
           <label class="modal-label">Base model</label>
-          <select class="modal-select" id="new-ft-base-model" onchange="_applyDefaultExclusions();filterNewFtDatasets();renderModuleChips();validateNewFt();updateCkptEstimate();_newFtDemos=_defaultNewFtDemos();_updateCropLength()">
+          <select class="modal-select" id="new-ft-base-model" onchange="_warnUnregisteredModel(this.value);_applyDefaultExclusions();filterNewFtDatasets();renderModuleChips();validateNewFt();updateCkptEstimate();_newFtDemos=_defaultNewFtDemos();_updateCropLength()">
             <!-- Options populated dynamically from /api/models (dashboard/models/*/registry.json). -->
           </select>
         </div>
@@ -1482,7 +1482,7 @@
         </div>
         <div>
           <label class="modal-label">Model</label>
-          <select class="modal-select" id="ds-model">
+          <select class="modal-select" id="ds-model" onchange="_warnUnregisteredModel(this.value);validateNewDataset()">
             <!-- Options populated dynamically from /api/models. -->
           </select>
         </div>
@@ -5350,6 +5350,22 @@ function _escAttr(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Popup dialog when the user selects a base model whose files aren't
+// downloaded. Reuses _showSeedDialog for the modal. The inline error +
+// disabled-Next/disabled-Encode logic still runs alongside this.
+window._warnUnregisteredModel = function(modelKey) {
+  if (!modelKey) return;
+  const meta = _remoteModels[modelKey] || {};
+  if (meta.registered !== false) return;
+  const label = _escAttr(meta.label || modelKey);
+  _showSeedDialog(
+    'Base model not downloaded',
+    `<code>${label}</code> isn’t available on this machine yet.<br><br>`
+    + `Run <code>./install.sh</code> in your underfit directory to download it.`,
+    [{label: 'OK', primary: true}]
+  );
+};
+
 // Open the file picker for the seed-LoRA upload. Always clear the input's
 // value first — otherwise re-picking the same file (after Cancel) doesn't
 // re-fire the change event and the picker appears to do nothing.
@@ -5970,8 +5986,12 @@ window.validateNewFt = function() {
   const lrStr = document.getElementById('new-ft-lr').value.trim();
   const el = document.getElementById('new-ft-ckpt-estimate');
   const btn = document.getElementById('new-ft-next-btn');
+  const baseModelKey = document.getElementById('new-ft-base-model').value;
+  const baseModelMeta = _remoteModels[baseModelKey] || {};
   let error = '';
   if (_newFtNoDatasets) error = 'Create a dataset first';
+  else if (baseModelKey && baseModelMeta.registered === false)
+    error = `Base model "${baseModelMeta.label || baseModelKey}" not downloaded — run ./install.sh`;
   else if (!name) error = '_name_empty';
   else if (runsData.some(r => r.display_name === name)) error = `Run "${name}" already exists`;
   else if (isNaN(steps) || steps < 100) error = 'Steps must be >= 100';
@@ -7025,6 +7045,7 @@ window.scanDatasetDir = async function() {
           }
         }
       }
+      validateNewDataset();
     }
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -7395,11 +7416,33 @@ window.dsxReencode = async function(dsId, event) {
   await scanDatasetDir();
 };
 
+// Disable Encode when the selected base model isn't fully registered
+// (its base config/ckpt files are missing). Wired to ds-model onchange and
+// called once after _dsShowStep('ds-step2b').
+window.validateNewDataset = function() {
+  const modelKey = document.getElementById('ds-model').value;
+  const modelMeta = _remoteModels[modelKey] || {};
+  const errEl = document.getElementById('ds-encode-error');
+  const btn = document.getElementById('ds-encode-btn');
+  if (modelKey && modelMeta.registered === false) {
+    errEl.textContent = `Base model "${modelMeta.label || modelKey}" not downloaded — run ./install.sh`;
+    btn.disabled = true;
+  } else {
+    if (errEl.textContent.includes('not downloaded')) errEl.textContent = '';
+    btn.disabled = false;
+  }
+};
+
 window.launchEncoding = async function() {
   const name = document.getElementById('ds-name').value.trim();
   const model = document.getElementById('ds-model').value;
+  const modelMeta = _remoteModels[model] || {};
   const gpus = Array.from(_dsSelectedGpus).sort();
   const errEl = document.getElementById('ds-encode-error');
+  if (model && modelMeta.registered === false) {
+    errEl.textContent = `Base model "${modelMeta.label || model}" not downloaded — run ./install.sh`;
+    return;
+  }
   if (!name) { errEl.textContent = 'Name required'; return; }
   if (gpus.length === 0) { errEl.textContent = 'Select at least one GPU'; return; }
   if (!_dsScanResult) return;

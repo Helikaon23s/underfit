@@ -218,6 +218,16 @@ def _load_models_from_json():
             if key not in grp["members"]:
                 grp["members"].append(key)
 
+        # A pack is "registered" iff its base config + checkpoint are both
+        # present on disk (symlinks must resolve). The wizard creates these
+        # symlinks during the model phase; if it was skipped, the registry
+        # still loads but the model can't be used until the files exist.
+        # Surfaced to the UI so it can block selection of un-downloaded packs.
+        base_cfg_p  = Path(paths["base_config"]) if paths.get("base_config") else None
+        base_ckpt_p = Path(paths["base_ckpt"])   if paths.get("base_ckpt")   else None
+        registered = bool(base_cfg_p and base_cfg_p.exists()
+                          and base_ckpt_p and base_ckpt_p.exists())
+
         # Frontend payload
         ui = m.get("ui", {})
         MODELS_UI_PAYLOAD[key] = {
@@ -236,6 +246,7 @@ def _load_models_from_json():
             "sequence":         ui.get("sequence"),
             "module_structure": ui.get("module_structure"),
             "lora_layer_template": ui.get("lora_layer_template"),
+            "registered":       registered,
         }
 
 # Loader is invoked further down, AFTER ENCODING_MODELS and SHARED_ENCODERS
