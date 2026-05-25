@@ -47,6 +47,56 @@ def _silence_compile_noise() -> None:
         pass
 
 
+def check_attention_backends() -> dict:
+    """Probe which attention implementations are importable and print a
+    one-line summary. Helps clear up the misleading 'flash_attn not installed'
+    warnings that SA3 prints by saying explicitly which path *will* run.
+
+    SA3's per-call routing (transformer.py):
+      1. flex_attention  — when a block_mask / score_mod is passed (inpainting
+                            and varied seq lengths trigger this).
+      2. flash_attn varlen — packed-batch, only if flash_attn AND bert_padding
+                              utilities both import.
+      3. flash_attn      — plain, when neither of the above applies.
+      4. SDPA            — torch.nn.functional fallback (always available).
+    """
+    paths = {"flash_attn": False, "flash_attn_varlen": False,
+             "flex_attention": False, "sdpa": True}
+    try:
+        import flash_attn  # noqa: F401
+        paths["flash_attn"] = True
+        try:
+            from flash_attn.bert_padding import unpad_input  # noqa: F401
+            paths["flash_attn_varlen"] = True
+        except ImportError:
+            pass
+    except ImportError:
+        pass
+    try:
+        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+        paths["flex_attention"] = True
+    except ImportError:
+        pass
+
+    if paths["flash_attn_varlen"]:
+        primary = "Flash Attention (varlen)"
+    elif paths["flash_attn"]:
+        primary = "Flash Attention"
+    elif paths["flex_attention"]:
+        primary = "FlexAttention (PyTorch compiled)"
+    else:
+        primary = "SDPA (PyTorch eager)"
+    available = [k for k, v in paths.items() if v]
+    print(f"Attention: primary path = {primary}", flush=True)
+    print(f"  available: {', '.join(available)}", flush=True)
+    if not paths["flash_attn"]:
+        print(
+            "  flash-attn not installed (optional; biggest speedup on Ampere+ with batch>1).",
+            flush=True,
+        )
+    return paths
+
+
 def check_attention_compute_capability() -> bool | None:
     """Return True if the GPU supports flex_attention's compiled path
     (compute capability >= 8.0), False if older, None if no GPU.

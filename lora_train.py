@@ -124,8 +124,9 @@ def main():
     if os.environ.get("SLURM_PROCID") is not None:
         args.seed = (args.seed or 0) + int(os.environ["SLURM_PROCID"])
     # Pre-warn (and quiet torch's noisy autotune warnings) on pre-Ampere GPUs.
-    from underfit.utils import check_attention_compute_capability
+    from underfit.utils import check_attention_compute_capability, check_attention_backends
     check_attention_compute_capability()
+    check_attention_backends()
     backend = get_backend(args.backend)
     run_training(args, backend)
 
