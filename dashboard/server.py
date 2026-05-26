@@ -4613,14 +4613,27 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
 
-                # ── write the SSE frame as a chunked-encoded body ──
+                # ── write each subsection as its own SSE event ─────────
+                # Splitting the payload across multiple chunks (instead of
+                # one combined chunk per tick) keeps each chunk small —
+                # important on Colab's port-proxy, which buffers a single
+                # large chunk (~400 KB on first connect) until enough
+                # subsequent bytes arrive, but forwards small chunks
+                # promptly. The frontend's onmessage already handles each
+                # field independently, so splitting is transparent.
                 if payload:
-                    seq += 1
-                    line = (
-                        f"id: {seq}\n"
-                        f"data: {json.dumps(payload, default=str)}\n\n"
-                    )
-                    _chunk(_pad(line.encode()))
+                    for k, v in payload.items():
+                        if k == "runs_etag":
+                            continue   # piggybacks on the "runs" event
+                        seq += 1
+                        event = {k: v}
+                        if k == "runs" and "runs_etag" in payload:
+                            event["runs_etag"] = payload["runs_etag"]
+                        line = (
+                            f"id: {seq}\n"
+                            f"data: {json.dumps(event, default=str)}\n\n"
+                        )
+                        _chunk(_pad(line.encode()))
                 else:
                     # heartbeat — comment line, ignored by EventSource,
                     # keeps the connection alive through idle proxies
