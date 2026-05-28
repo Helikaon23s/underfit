@@ -1513,6 +1513,29 @@
         <button class="modal-launch" id="ds-done-btn" onclick="closeNewDatasetModal()" style="display:none;background:var(--turquoise)">Done</button>
       </div>
     </div>
+
+    <!-- Step 2-import: scan detected pre-encoded latents -->
+    <!-- (separate from ds-step2b which is for raw-audio re-encoding) -->
+    <div id="ds-step2-import" style="display:none">
+      <div id="ds-import-summary" style="color:var(--text2);font-size:0.85em;margin-bottom:10px;line-height:1.5"></div>
+      <div id="ds-import-warning" style="display:none;padding:8px 12px;background:rgba(249,115,22,0.1);border-left:3px solid var(--orange);color:var(--text);font-size:0.85em;margin-bottom:10px;line-height:1.4"></div>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:12px;margin-bottom:8px">
+        <div>
+          <label class="modal-label">Dataset name</label>
+          <input type="text" class="resume-input" id="ds-import-name" onblur="if(this.value.trim())this.value=_slugify(this.value)">
+        </div>
+        <div>
+          <label class="modal-label">Encoder</label>
+          <select class="modal-select" id="ds-import-model"></select>
+        </div>
+      </div>
+      <div id="ds-import-encoder-help" style="font-size:0.78em;color:var(--text2);margin-bottom:10px;line-height:1.4"></div>
+      <div class="resume-error" id="ds-import-error"></div>
+      <div class="modal-actions" style="margin-top:12px">
+        <button class="modal-cancel" onclick="dsBackToStep1()">Back</button>
+        <button class="modal-launch" id="ds-import-btn" onclick="launchImport()" style="background:var(--turquoise)">Import</button>
+      </div>
+    </div>
     <div class="modal-loading" id="ds-encode-loading" style="display:none">
       <div class="ml-spinner"></div>
       <div class="ml-text">Starting encode...</div>
@@ -6916,7 +6939,7 @@ window.closeNewDatasetModal = function() {
 };
 
 function _dsShowStep(stepId) {
-  for (const id of ['ds-step1', 'ds-step2b', 'ds-step3']) {
+  for (const id of ['ds-step1', 'ds-step2b', 'ds-step2-import', 'ds-step3']) {
     document.getElementById(id).style.display = id === stepId ? '' : 'none';
   }
   const inner = document.getElementById('ds-modal-inner');
@@ -7015,7 +7038,18 @@ window.scanDatasetDir = async function() {
     progFill.style.width = '100%';
     progText.textContent = 'Done!';
     _dsScanResult = data;
-    _dsFileIncluded = new Array(data.audio_files.length).fill(true);
+
+    // ── Pre-encoded import branch ──────────────────────────────────
+    // The scan endpoint reports `mode` for any directory that isn't
+    // straight raw-audio. Pre-encoded latents (underfit-native,
+    // SA3-native, or bare .npy) skip the encode form and go to the
+    // import step.
+    if (data.mode && data.mode !== 'raw_audio') {
+      _dsRenderImportStep(data);
+      return;
+    }
+
+    _dsFileIncluded = new Array((data.audio_files || []).length).fill(true);
 
     {
       const summ = `${data.total_files} audio files (${data.files_with_tags} with tags, ${data.files_with_json} with JSON sidecars)`;
@@ -7449,6 +7483,139 @@ window.validateNewDataset = function() {
   } else {
     if (errEl.textContent.includes('not downloaded')) errEl.textContent = '';
     btn.disabled = false;
+  }
+};
+
+// ── Pre-encoded dataset import ──────────────────────────────────────
+// Called when the scan response carries mode != "raw_audio". Builds
+// the import step UI (summary + encoder picker), then launchImport()
+// POSTs to /api/datasets/import to commit.
+
+function _dsRenderImportStep(data) {
+  const mode = data.mode;
+  const candidates = data.candidate_model_keys || [];
+  const shape = data.sample_latent_shape || [];
+  const shapeStr = shape.length ? `(${shape.join(', ')})` : 'unknown';
+
+  // Summary copy varies by mode.
+  let summaryHtml = '';
+  if (mode === 'underfit_native_import') {
+    summaryHtml =
+      `<div><strong>Underfit-native pre-encoded dataset detected.</strong></div>` +
+      `<div>${data.num_npy} latent files, shape ${shapeStr}, encoder <code>${data.detected_model_key}</code>.</div>` +
+      `<div>The dataset will be registered in place — no files are copied.</div>`;
+  } else if (mode === 'preencoded_import') {
+    summaryHtml =
+      `<div><strong>Pre-encoded latents detected</strong> (likely SA3 format` +
+      (data.has_silence_npy ? ` — found <code>silence.npy</code>` : '') +
+      `).</div>` +
+      `<div>${data.num_npy} latent files, shape ${shapeStr}, ${data.num_json_sidecars} matched <code>.json</code> sidecars.</div>` +
+      `<div>A symlinked shadow will be built under <code>state/datasets/&lt;name&gt;/</code> — the source files are not copied or modified.</div>`;
+  } else if (mode === 'bare_import') {
+    summaryHtml =
+      `<div><strong>Bare <code>.npy</code> directory detected</strong> — no per-clip metadata.</div>` +
+      `<div>${data.num_npy} latent files, shape ${shapeStr}.</div>` +
+      `<div>A symlinked shadow will be built under <code>state/datasets/&lt;name&gt;/</code>; <code>.json</code> sidecars will be synthesized from the latent shape (no prompts available).</div>`;
+  } else if (mode === 'unknown') {
+    summaryHtml =
+      `<div><strong>Couldn't identify this directory.</strong></div>` +
+      `<div style="color:var(--red)">${data.error || ''}</div>`;
+  }
+  document.getElementById('ds-import-summary').innerHTML = summaryHtml;
+
+  // Warnings.
+  const warn = document.getElementById('ds-import-warning');
+  if (mode === 'bare_import') {
+    warn.innerHTML =
+      `<strong>Heads-up:</strong> these latents have no per-clip prompts. At training time, you'll need to use the <em>Path</em> or <em>Fixed</em> prompt source in New Finetune — the <em>Tags</em> source will yield empty prompts.`;
+    warn.style.display = '';
+  } else if (mode === 'preencoded_import' && candidates.length > 1) {
+    warn.innerHTML =
+      `<strong>Encoder identification:</strong> we can't tell from the files alone which encoder produced these latents. The candidates below all have a matching <code>latent_dim=${shape[0]}</code>. Pick the one used to encode this data — if you guess wrong, training will still work since these encoders are distillation pairs producing similar latent distributions, but inference quality may suffer.`;
+    warn.style.display = '';
+  } else {
+    warn.style.display = 'none';
+  }
+
+  // Populate encoder picker.
+  const sel = document.getElementById('ds-import-model');
+  sel.innerHTML = '';
+  if (mode === 'underfit_native_import' && data.detected_model_key) {
+    // Single auto-detected encoder — show only that one (disabled).
+    const opt = document.createElement('option');
+    opt.value = data.detected_model_key;
+    opt.textContent = data.detected_model_key;
+    sel.appendChild(opt);
+    sel.disabled = true;
+  } else {
+    sel.disabled = false;
+    // Light filename-based hint to pre-select.
+    const lower = (data.path || '').toLowerCase();
+    let preferred = null;
+    if (/\bsame-?l\b|\bmedium\b|\blarge\b/.test(lower)) preferred = 'sa3-medium';
+    else if (/\bsame-?s\b|\bsmall\b|\bsm[-_]?music\b/.test(lower)) preferred = 'sa3-sm-music';
+    else if (/\bsm[-_]?sfx\b|\bsfx\b/.test(lower)) preferred = 'sa3-sm-sfx';
+    for (const key of candidates) {
+      const meta = _remoteModels[key] || {};
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = `${meta.label || key}  (latent_dim=${meta.latent_dim})`;
+      if (key === preferred) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  }
+  document.getElementById('ds-import-encoder-help').textContent =
+    (candidates.length > 1)
+      ? `Multiple registered models share latent_dim=${shape[0]}. Pick the encoder that actually produced these latents.`
+      : '';
+
+  // Name input default — from the directory's basename.
+  const baseName = _slugify((data.path || '').split('/').pop() || 'imported');
+  document.getElementById('ds-import-name').value = baseName;
+
+  // Disable the Import button on "unknown" mode.
+  const btn = document.getElementById('ds-import-btn');
+  btn.disabled = (mode === 'unknown' || candidates.length === 0);
+
+  document.getElementById('ds-modal-title').textContent = 'Import Pre-Encoded Dataset';
+  _dsShowStep('ds-step2-import');
+}
+
+window.launchImport = async function() {
+  if (!_dsScanResult) return;
+  const errEl = document.getElementById('ds-import-error');
+  errEl.textContent = '';
+  const name = document.getElementById('ds-import-name').value.trim();
+  const model = document.getElementById('ds-import-model').value;
+  if (!name) { errEl.textContent = 'Name required'; return; }
+  if (!model) { errEl.textContent = 'Encoder required'; return; }
+  const btn = document.getElementById('ds-import-btn');
+  btn.disabled = true;
+  btn.textContent = 'Importing…';
+  try {
+    const res = await fetch('/api/datasets/import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        path: _dsScanResult.path,
+        name,
+        model,
+        mode: _dsScanResult.mode,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'Import failed';
+      btn.disabled = false;
+      btn.textContent = 'Import';
+      return;
+    }
+    // Success: close the modal; the SSE stream will deliver the new dataset.
+    closeNewDatasetModal();
+  } catch (e) {
+    errEl.textContent = 'Import failed: ' + e;
+    btn.disabled = false;
+    btn.textContent = 'Import';
   }
 };
 

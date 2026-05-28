@@ -229,6 +229,24 @@ def _load_models_from_json():
         registered = bool(base_cfg_p and base_cfg_p.exists()
                           and base_ckpt_p and base_ckpt_p.exists())
 
+        # Read the pretransform's latent_dim from training_template.json so
+        # the dataset-import flow can match an imported (.npy shape) against
+        # registered encoders — registry-driven, no hardcoded dims. Stays
+        # None if the template can't be parsed or the field is missing.
+        latent_dim = None
+        try:
+            tmpl_path = registry_path.parent / "training_template.json"
+            with open(tmpl_path) as f:
+                tmpl = _json.load(f)
+            pt = tmpl.get("model", {}).get("pretransform", {})
+            pt_cfg = pt.get("config", {}) if isinstance(pt, dict) else {}
+            v = pt_cfg.get("latent_dim")
+            if isinstance(v, int):
+                latent_dim = v
+        except Exception:
+            pass
+        entry["latent_dim"] = latent_dim
+
         # Frontend payload
         ui = m.get("ui", {})
         MODELS_UI_PAYLOAD[key] = {
@@ -240,6 +258,7 @@ def _load_models_from_json():
             "arc_type":             m.get("arc", {}).get("type"),
             "encoder_id":           enc_id,
             "compatible_encoders":  m.get("compatible_encoders", [enc_id] if enc_id else []),
+            "latent_dim":           latent_dim,
             "show_in_finetune_dropdown": ui.get("show_in_finetune_dropdown", True),
             "show_in_dataset_dropdown":  ui.get("show_in_dataset_dropdown", True),
             "vram":             ui.get("vram"),
@@ -3322,6 +3341,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             self._handle_datasets_encode(body)
+        elif parsed.path == "/api/datasets/import":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            self._handle_datasets_import(body)
         else:
             # Route: POST /api/datasets/{id}/{action}
             ds_m = re.match(r"^/api/datasets/([^/]+)/(stop|delete)$", parsed.path)
@@ -5312,8 +5335,311 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             })
         return file_info, total, files_with_tags, files_with_json
 
+    # ── Pre-encoded dataset import ───────────────────────────────────────
+    # When the user pastes a directory of .npy files into the New Dataset
+    # scan field, we don't re-encode — we register an "imported" dataset
+    # whose latents live in a symlinked shadow under
+    # state/datasets/<name>/latents/<model_key>/. The shadow's `.json`
+    # sidecars are materialised into underfit's schema so every downstream
+    # feature (training loop, dataset listing, etc.) treats it as a
+    # first-class native dataset.
+    #
+    # Three layouts get recognised:
+    #   1. underfit_native_import  — the source dir already has
+    #      latents/<key>/...npy and our .json schema. No conversion needed,
+    #      just register a dataset record pointing at it.
+    #   2. preencoded_import       — per-file .npy + .json pairs (SA3's
+    #      pre_encode_dataset.py format, or anything similar). Materialise
+    #      shadow with rewritten .json sidecars.
+    #   3. bare_import             — .npy files only, no .json sidecars.
+    #      Generate minimal .json from latent shape + downsampling ratio.
+    #      Prompts unavailable — user must use Path / Fixed at train time.
+
+    def _detect_dataset_layout(self, path: Path) -> dict:
+        """Inspect a directory and decide whether it's raw audio or
+        pre-encoded latents. Returns a dict with `mode` and stats.
+
+        Keys:
+          mode: "raw_audio" | "underfit_native_import" |
+                "preencoded_import" | "bare_import" | "empty" | "unknown"
+          num_npy:           count of .npy files (excluding silence.npy)
+          num_audio:         count of audio files
+          num_json_sidecars: count of .json files matching .npy stems
+          sample_npy_path:   one example .npy (for shape probing)
+          sample_latent_shape: shape tuple of the sample .npy (or None)
+          has_silence_npy:   True if a top-level silence.npy exists
+                             (strong signal for SA3 pre_encode_dataset.py)
+          has_underfit_latents_dir: True if `<path>/latents/<key>/` layout
+                             matches an underfit native dataset
+          detected_model_key: when underfit-native, the key the layout
+                              corresponds to (or None)
+          candidate_model_keys: list of registered model_keys whose
+                                pretransform.latent_dim == sample_latent_shape[0]
+                                (always populated for non-empty .npy dirs)
+        """
+        AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aiff", ".aif"}
+        result = {
+            "mode": "empty", "num_npy": 0, "num_audio": 0,
+            "num_json_sidecars": 0, "sample_npy_path": None,
+            "sample_latent_shape": None, "has_silence_npy": False,
+            "has_underfit_latents_dir": False, "detected_model_key": None,
+            "candidate_model_keys": [],
+        }
+
+        # Quick top-level inventory (don't walk the whole tree yet — most
+        # cases are decidable from the top level alone).
+        try:
+            top = list(path.iterdir())
+        except OSError as e:
+            result["mode"] = "unknown"
+            result["error"] = str(e)
+            return result
+
+        result["has_silence_npy"] = (path / "silence.npy").exists()
+
+        # ── 1. Underfit-native layout: <path>/latents/<key>/ ──
+        latents_dir = path / "latents"
+        if latents_dir.is_dir():
+            for sub in latents_dir.iterdir():
+                if not sub.is_dir():
+                    continue
+                # Sub directory name must be a registered model key
+                if sub.name in MODELS_UI_PAYLOAD:
+                    # Confirm it actually has .npy files
+                    if next(sub.rglob("*.npy"), None) is not None:
+                        result["has_underfit_latents_dir"] = True
+                        result["detected_model_key"] = sub.name
+                        break
+
+        # Recursive .npy / audio / .json sidecar counts. Bounded scan —
+        # if we already have hundreds we don't need more for the decision.
+        npy_files = []
+        for f in path.rglob("*"):
+            if not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            name = f.name.lower()
+            if ext == ".npy":
+                # Skip silence.npy from the candidate count — it's metadata.
+                if name == "silence.npy":
+                    continue
+                npy_files.append(f)
+                if len(npy_files) <= 256:
+                    # Track for later shape probe
+                    pass
+            elif ext in AUDIO_EXTS:
+                result["num_audio"] += 1
+        result["num_npy"] = len(npy_files)
+
+        # If the dir has audio files, treat as raw_audio — the existing
+        # scan flow handles it.
+        if result["num_audio"] > 0 and result["num_npy"] == 0:
+            result["mode"] = "raw_audio"
+            return result
+
+        if result["num_npy"] == 0:
+            # Empty or only non-audio non-npy files (manifests etc.).
+            result["mode"] = "empty" if result["num_audio"] == 0 else "raw_audio"
+            return result
+
+        # ── Probe one .npy to learn the latent shape ──
+        sample = npy_files[0]
+        result["sample_npy_path"] = str(sample)
+        try:
+            import numpy as _np
+            arr = _np.load(str(sample), mmap_mode="r")
+            shape = tuple(int(x) for x in arr.shape)
+            result["sample_latent_shape"] = shape
+            del arr
+        except Exception as e:
+            result["mode"] = "unknown"
+            result["error"] = f"failed to load sample .npy: {e}"
+            return result
+
+        # ── Registry-driven candidate matching ──
+        # Latent shape conventions:
+        #   - (C, T)    : 2D, channels-first    (underfit + SA3 standard)
+        #   - (1, C, T) : 3D, with batch axis   (some external exporters)
+        # Use the channels dim, which is shape[-2] in both layouts.
+        if len(shape) == 2:
+            channels = shape[0]
+        elif len(shape) == 3:
+            channels = shape[1]
+        else:
+            channels = None
+        if channels is not None:
+            result["candidate_model_keys"] = [
+                k for k, m in MODELS_UI_PAYLOAD.items()
+                if m.get("latent_dim") == channels
+            ]
+        if not result["candidate_model_keys"]:
+            result["mode"] = "unknown"
+            result["error"] = (
+                f"Latent shape {shape} doesn't match any registered model's "
+                f"pretransform.latent_dim. Registered: "
+                + ", ".join(
+                    f"{k}(latent_dim={m.get('latent_dim')})"
+                    for k, m in MODELS_UI_PAYLOAD.items()
+                )
+            )
+            return result
+
+        # ── Count .json sidecars matching .npy stems ──
+        # Cap the count check at 256 files — we just need to know "many" vs "few".
+        json_matches = 0
+        for npy in npy_files[:256]:
+            if npy.with_suffix(".json").exists():
+                json_matches += 1
+        result["num_json_sidecars"] = json_matches
+
+        # ── Final mode pick ──
+        if result["has_underfit_latents_dir"]:
+            result["mode"] = "underfit_native_import"
+        elif json_matches > 0:
+            # Per-file .json pairs — SA3 native or similar
+            result["mode"] = "preencoded_import"
+        else:
+            result["mode"] = "bare_import"
+        return result
+
+    def _materialize_import_shadow(self, src_dir: Path, dst_dir: Path,
+                                   model_key: str, mode: str,
+                                   sample_rate: int) -> dict:
+        """Build the underfit-shadow tree under dst_dir from a source dir
+        of pre-encoded latents.
+
+        For each .npy in src_dir:
+          - link <dst_dir>/<relpath>.npy → <src_dir>/<relpath>.npy
+            (symlink, falling back to hardlink, falling back to copy)
+          - materialise <dst_dir>/<relpath>.json in underfit's schema,
+            converting from SA3 keys if present or fabricating from the
+            latent shape if not.
+
+        Returns {linked, copied, json_written, errors}.
+        """
+        import numpy as _np
+        import shutil
+
+        # Resolve downsampling_ratio for the chosen model. Used to derive
+        # seconds_total for bare imports. Look in the training_template.
+        info = MODEL_INFO.get(model_key, {})
+        downsampling_ratio = 1
+        try:
+            tmpl = json.load(open(info["template"]))
+            pt_cfg = tmpl.get("model", {}).get("pretransform", {}).get("config", {})
+            downsampling_ratio = int(pt_cfg.get("downsampling_ratio", 1) or 1)
+        except Exception:
+            pass
+
+        def _link_or_copy(src: Path, dst: Path) -> str:
+            """Return 'symlink' / 'hardlink' / 'copy' for stats."""
+            try:
+                os.symlink(src, dst)
+                return "symlink"
+            except (OSError, NotImplementedError):
+                pass
+            try:
+                os.link(src, dst)
+                return "hardlink"
+            except OSError:
+                pass
+            shutil.copyfile(src, dst)
+            return "copy"
+
+        stats = {"linked": 0, "copied": 0, "hardlinked": 0,
+                 "json_written": 0, "errors": 0, "broken_shape": 0}
+
+        for npy_src in sorted(src_dir.rglob("*.npy")):
+            if npy_src.name.lower() == "silence.npy":
+                continue  # SA3 helper file — not a sample
+            try:
+                rel = npy_src.relative_to(src_dir)
+            except ValueError:
+                continue
+            npy_dst = dst_dir / rel
+            json_dst = npy_dst.with_suffix(".json")
+            npy_dst.parent.mkdir(parents=True, exist_ok=True)
+
+            # Verify shape matches the chosen model's latent_dim.
+            expected_C = MODELS_UI_PAYLOAD.get(model_key, {}).get("latent_dim")
+            try:
+                arr = _np.load(str(npy_src), mmap_mode="r")
+                shape = tuple(int(x) for x in arr.shape)
+                ch = shape[0] if len(shape) == 2 else (shape[1] if len(shape) == 3 else None)
+                T = shape[-1]
+                del arr
+            except Exception:
+                stats["errors"] += 1
+                continue
+            if expected_C is not None and ch != expected_C:
+                stats["broken_shape"] += 1
+                continue
+
+            # Link/copy the .npy. Skip if already linked from a prior import.
+            if not npy_dst.exists():
+                try:
+                    kind = _link_or_copy(npy_src, npy_dst)
+                    stats[{"symlink": "linked", "hardlink": "hardlinked",
+                           "copy": "copied"}[kind]] += 1
+                except Exception:
+                    stats["errors"] += 1
+                    continue
+
+            # Materialise a fresh .json in underfit's schema.
+            src_json = npy_src.with_suffix(".json")
+            src_md = {}
+            if src_json.exists():
+                try:
+                    with open(src_json) as f:
+                        src_md = json.load(f) or {}
+                except Exception:
+                    src_md = {}
+
+            seconds_total = src_md.get("seconds_total")
+            if seconds_total is None:
+                # Bare-import: derive from latent length + downsampling
+                seconds_total = round((T * downsampling_ratio) / max(1, sample_rate), 3)
+            audio_samples = src_md.get("audio_samples")
+            if audio_samples is None:
+                audio_samples = int(round(seconds_total * sample_rate))
+
+            new_md = {
+                "path":          src_md.get("path", str(npy_src)),
+                "relpath":       str(rel),
+                "src_relpath":   src_md.get("src_relpath", str(rel)),
+                "seconds_total": seconds_total,
+                "seconds_start": src_md.get("seconds_start", 0),
+                "audio_samples": audio_samples,
+                "latent_shape":  list(shape),
+            }
+            if "padding_mask" in src_md:
+                new_md["padding_mask"] = src_md["padding_mask"]
+            # Preserve any tag-like keys from the source .json (prompt,
+            # genre, bpm, etc.) verbatim — same logic extract_tags uses.
+            _RESERVED = {"path", "relpath", "src_relpath", "seconds_total",
+                         "seconds_start", "audio_samples", "latent_shape",
+                         "padding_mask"}
+            for k, v in src_md.items():
+                if k in _RESERVED:
+                    continue
+                if isinstance(v, (str, int, float)) and v:
+                    new_md[k] = v if isinstance(v, str) else str(v)
+            try:
+                with open(json_dst, "w") as f:
+                    json.dump(new_md, f)
+                stats["json_written"] += 1
+            except Exception:
+                stats["errors"] += 1
+        return stats
+
     def _handle_datasets_scan(self, body):
-        """Scan a directory for audio files, check tags & pre-encoded data.
+        """Scan a directory for audio files or pre-encoded latents.
+
+        Branches by content:
+          - if it's a directory of audio files → existing raw-audio flow
+            (returns audio_files / total_files / files_with_tags / ...)
+          - if it's a directory of .npy latents → import flow
+            (returns mode / sample_latent_shape / candidate_model_keys / ...)
 
         Streams NDJSON progress lines, final line is the full result or error.
         """
@@ -5341,6 +5667,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
+        # ── Layout detection (cheap top-level + bounded recursive count) ──
+        send_progress("detecting layout", 0, 1)
+        layout = self._detect_dataset_layout(p)
+        mode = layout["mode"]
+
+        # ── Pre-encoded import paths ──
+        if mode in ("underfit_native_import", "preencoded_import",
+                    "bare_import", "unknown"):
+            send_progress("layout decided", 1, 1)
+            payload = {
+                "path": str(p),
+                "mode": mode,
+                "num_npy": layout["num_npy"],
+                "num_json_sidecars": layout["num_json_sidecars"],
+                "sample_latent_shape": layout["sample_latent_shape"],
+                "has_silence_npy": layout["has_silence_npy"],
+                "detected_model_key": layout["detected_model_key"],
+                "candidate_model_keys": layout["candidate_model_keys"],
+            }
+            if "error" in layout:
+                payload["error"] = layout["error"]
+            self.wfile.write((json.dumps(payload) + "\n").encode())
+            self.wfile.flush()
+            return
+
+        # ── Raw-audio scan flow (existing behaviour) ──
         file_info, total_files, files_with_tags, files_with_json = \
             self._scan_audio_tags(str(p), sample_size=None,
                                   tag_sample_size=None,
@@ -5354,6 +5706,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         result = json.dumps({
             "path": str(p),
+            "mode": "raw_audio",
             "audio_files": file_info,
             "total_files": total_files,
             "files_with_tags": files_with_tags,
@@ -5361,6 +5714,167 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         })
         self.wfile.write(result.encode() + b"\n")
         self.wfile.flush()
+
+    def _handle_datasets_import(self, body):
+        """Commit a pre-encoded dataset import.
+
+        Body:
+          path        : source directory pasted by the user
+          name        : dataset name (slug-able)
+          mode        : "underfit_native_import" | "preencoded_import" | "bare_import"
+          model       : chosen model_key (the encoder the user attests these
+                        latents were produced with)
+
+        Behaviour:
+          - underfit_native_import: just registers a dataset record
+            pointing at the source dir (no shadow built — source already
+            matches our layout).
+          - preencoded_import / bare_import: materialises a symlinked
+            shadow under DATASETS_DIR/<name>/latents/<model>/ and
+            registers a dataset record whose latent_dir is the shadow.
+        """
+        raw_name = body.get("name", "").strip()
+        name = _slugify(raw_name)
+        src_path = body.get("path", "").strip()
+        mode = body.get("mode", "").strip()
+        model = body.get("model", "").strip()
+
+        if not name or not src_path or not mode or not model:
+            self._json_response({
+                "error": "name, path, mode, and model are required"
+            }, status=400)
+            return
+        if mode not in ("underfit_native_import", "preencoded_import", "bare_import"):
+            self._json_response({"error": f"unsupported import mode: {mode}"}, status=400)
+            return
+        if model not in MODELS_UI_PAYLOAD:
+            self._json_response({"error": f"unknown model: {model}"}, status=400)
+            return
+
+        src = Path(src_path).expanduser().resolve()
+        if not src.is_dir():
+            self._json_response({"error": f"Not a directory: {src}"}, status=400)
+            return
+
+        # ── Same-name collision handling (mirrors the encode path) ──
+        for existing in list(datasets_registry.list_datasets()):
+            if _slugify(existing.get("name", "")) != name:
+                continue
+            status = existing.get("status", "")
+            num_files = existing.get("num_files", 0) or 0
+            is_zombie = (status == "error") or (status == "ready" and num_files == 0)
+            if is_zombie:
+                datasets_registry.remove_dataset(existing["id"])
+                continue
+            self._json_response({
+                "error": f"Dataset name '{name}' already exists (id={existing['id']}, "
+                         f"status={status}). Delete it first."
+            }, status=409)
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d")
+        ds_id = f"{name}-{model}-{timestamp}"
+        if datasets_registry.get_dataset(ds_id):
+            ds_id += f"-{datetime.now().strftime('%H%M%S')}"
+
+        # ── Layout-specific path setup ──
+        sample_rate = 44100  # SA3 default; matches existing encode path
+        if mode == "underfit_native_import":
+            # Source already matches our layout. Use the source's
+            # latents/<model>/ as the dataset's latent_dir directly.
+            cand_latent_dir = src / "latents" / model
+            if not cand_latent_dir.is_dir():
+                # User picked a different model than what's actually on disk —
+                # try to find any model_key subdirectory and accept that.
+                latents_parent = src / "latents"
+                found = next(
+                    (sd for sd in latents_parent.iterdir()
+                     if sd.is_dir() and sd.name in MODELS_UI_PAYLOAD),
+                    None,
+                ) if latents_parent.is_dir() else None
+                if found is None:
+                    self._json_response({
+                        "error": "underfit_native_import expected "
+                                 f"{cand_latent_dir} to exist."
+                    }, status=400)
+                    return
+                cand_latent_dir = found
+                model = cand_latent_dir.name
+            latent_dir = cand_latent_dir
+            shadow_built = False
+            shadow_stats = {}
+        else:
+            # Build the symlinked shadow.
+            shadow_root = DATASETS_DIR / name
+            latent_dir = shadow_root / "latents" / model
+            latent_dir.mkdir(parents=True, exist_ok=True)
+            shadow_stats = self._materialize_import_shadow(
+                src, latent_dir, model, mode, sample_rate=sample_rate,
+            )
+            shadow_built = True
+
+        # ── Count files in the dataset (.npy files in latent_dir) ──
+        num_files = sum(1 for _ in latent_dir.rglob("*.npy"))
+        if num_files == 0:
+            self._json_response({
+                "error": "No .npy files imported. "
+                         + (f"Shadow stats: {shadow_stats}" if shadow_built else "")
+            }, status=400)
+            return
+
+        # ── Build dataset_files (sources of truth list) ──
+        # For imports we store the latent paths since there's no audio source.
+        ds_files = []
+        for npy in sorted(latent_dir.rglob("*.npy")):
+            try:
+                rel = str(npy.relative_to(latent_dir))
+            except ValueError:
+                rel = npy.name
+            ds_files.append({"relpath": rel, "path": str(npy)})
+
+        ds = {
+            "id": ds_id,
+            "name": name,
+            "input_dir": str(src),
+            "latent_dir": str(latent_dir),
+            "model": model,
+            "latent_dim": MODELS_UI_PAYLOAD[model].get("latent_dim"),
+            "num_files": num_files,
+            "sample_rate": sample_rate,
+            "status": "ready",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "encoding_pid": None,
+            "encoding_gpus": [],
+            "encoding_progress": {"encoded": num_files, "skipped": 0,
+                                  "errors": 0, "total": num_files},
+            "log_path": "",
+            "custom_metadata_module": str(PRE_DIR / "prompt_templates.py"),
+            "details": {},
+            "dataset_files": ds_files,
+            "imported": True,
+            "import_mode": mode,
+            "import_source": str(src),
+            "import_shadow_stats": shadow_stats if shadow_built else None,
+        }
+        # Generate ground-truth tracks for demos (best-effort — bare imports
+        # may have no audio source, in which case _generate_dataset_ground_truth
+        # returns ([], []) and we just live without demos for now).
+        try:
+            gt_list, gt_prompts = _generate_dataset_ground_truth(
+                ds_files, name, model=model
+            )
+            if gt_list:
+                ds["ground_truth"] = gt_list
+                ds["demo_prompts"] = gt_prompts
+        except Exception as e:
+            print(f"[import] ground-truth generation failed for {ds_id}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+        datasets_registry.add_dataset(ds)
+        print(f"[import] imported dataset '{ds_id}' "
+              f"({num_files} latents, mode={mode}, model={model})", flush=True)
+        self._json_response({"ok": True, "id": ds_id, "num_files": num_files,
+                             "shadow_stats": shadow_stats if shadow_built else None})
 
     def _handle_datasets_encode(self, body):
         """Launch pre-encoding on multiple GPUs."""
