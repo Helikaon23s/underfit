@@ -3588,13 +3588,41 @@ function renderTabs() {
   if (activeTab) activeTab.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'instant' });
 }
 
+// Set of run IDs whose Console Output state has been "settled" for this
+// session — either auto-opened by us when the run was active, or
+// manually toggled by the user. Once settled, we stop auto-acting so
+// the user can keep the panel closed on an active run if they want.
+const _logAutoSettled = new Set();
+
 window.toggleLog = function() {
   const container = document.getElementById('log-container');
   const btn = document.getElementById('log-toggle');
   const isOpen = container.classList.toggle('open');
   btn.innerHTML = (isOpen ? '&#9660;' : '&#9654;') + ' Console Output';
   if (isOpen) container.scrollTop = container.scrollHeight;
+  // User expressed a preference — stop auto-opening for this run.
+  if (currentRunId) _logAutoSettled.add(currentRunId);
 };
+
+// Auto-expand Console Output when a run is actively training (or in a
+// status that imminently produces log lines: loading/resuming/demos).
+// Idempotent per run via _logAutoSettled, so a single auto-open is
+// reverted by the user's next click and we don't fight them.
+function _maybeAutoOpenLog() {
+  if (!currentRunId) return;
+  if (_logAutoSettled.has(currentRunId)) return;
+  const status = _currentStatus && _currentStatus.status;
+  if (!['training', 'loading', 'resuming', 'demos'].includes(status)) return;
+  const container = document.getElementById('log-container');
+  if (container.classList.contains('open')) {
+    _logAutoSettled.add(currentRunId);
+    return;
+  }
+  container.classList.add('open');
+  document.getElementById('log-toggle').innerHTML = '&#9660; Console Output';
+  container.scrollTop = container.scrollHeight;
+  _logAutoSettled.add(currentRunId);
+}
 
 function highlightCkptRow(ckptPath) {
   const row = document.querySelector(`.ckpt-row[data-ckpt-path="${CSS.escape(ckptPath)}"]`);
@@ -3796,6 +3824,8 @@ function refreshOpenModalGpuGrids() {
 function _renderStatus(status, refreshRunId) {
     if (currentRunId !== refreshRunId) return;
     _currentStatus = status;
+    // Auto-expand the Console Output for active runs on first sight.
+    _maybeAutoOpenLog();
 
     // Connection status — just show connected once we get data
     document.getElementById('status-text').style.display = 'none';
