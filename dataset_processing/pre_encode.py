@@ -171,14 +171,24 @@ def load_audio(path, target_sr, target_channels, device):
 def extract_tags(filepath):
     """Extract tag fields from an audio file.
 
-    Priority: JSON sidecar ({stem}.json) > embedded ID3/Vorbis tags.
-    Checks same directory and sibling json/ directory for sidecars.
+    Priority:
+      1. JSON sidecar ({stem}.json) — richest, custom keys preserved
+      2. Plain .txt sidecar ({stem}.txt) — Stable Audio 3 convention
+         (https://github.com/Stability-AI/stable-audio-3 scripts/train_lora.py).
+         Whole file content (stripped) becomes the "prompt" key.
+      3. Embedded ID3 / Vorbis / M4A tags via audio_metadata
+
+    All three forms also accept a sibling directory layout — `<dir>/clip.wav`
+    pairs with `<dir>/clip.json` / `<dir>/clip.txt` (same dir) or
+    `<parent>/json/clip.json` / `<parent>/txt/clip.txt` (sibling subfolder),
+    useful for keeping captions out of the audio folder.
+
     For JSON sidecars, all string/number values are kept (not just TAG_KEYS),
     so custom keys like 'id' or 'prompt' are preserved in the latent metadata.
     """
     fp = Path(filepath)
     stem = fp.stem
-    # Check for JSON sidecar: same dir, then sibling json/ dir
+    # 1. JSON sidecar — same dir, then sibling json/ dir
     sidecar_candidates = [
         fp.with_suffix(".json"),
         fp.parent.parent / "json" / (stem + ".json"),
@@ -195,7 +205,23 @@ def extract_tags(filepath):
             except Exception:
                 pass
 
-    # Fall back to embedded tags via audio_metadata (lazy import to avoid SIGSEGV)
+    # 2. Plain .txt sidecar (SA3 convention) — same dir, then sibling txt/ dir.
+    # Whole file content (whitespace-stripped) becomes the "prompt" tag key.
+    # Empty file → fall through to embedded tags.
+    txt_candidates = [
+        fp.with_suffix(".txt"),
+        fp.parent.parent / "txt" / (stem + ".txt"),
+    ]
+    for txt in txt_candidates:
+        if txt.exists():
+            try:
+                content = txt.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    return {"prompt": content}
+            except Exception:
+                pass
+
+    # 3. Fall back to embedded tags via audio_metadata (lazy import to avoid SIGSEGV)
     try:
         import audio_metadata
         track_md = audio_metadata.load(str(filepath))

@@ -132,9 +132,11 @@ Any string/number values are used
 }
 ```
 
-**b. Embedded audio tags** (ID3 on MP3, Vorbis on FLAC/OGG, M4A atoms, etc.) — read via the `audio_metadata` library. For example: `title`, `artist`, `album`, `genre`, `label`, `date`, `composer`, `bpm`. If your music library is already tagged in Picard / Mp3tag, you get those for free.
+**b. Plain `.txt` sidecar** — the [Stable Audio 3 convention](https://github.com/Stability-AI/stable-audio-3/blob/main/scripts/train_lora.py). Same stem as the audio, `.txt` extension, sitting either next to the audio (`my-songs/01.wav` + `my-songs/01.txt`) or in a sibling `txt/` folder (`my-songs/01.wav` + `my-songs/txt/01.txt`). The whole file content (whitespace-stripped) becomes the `prompt` metadata key. Simplest possible per-clip captioning — and if you already have a dataset prepared for SA3's own `pre_encode_dataset.py` script, it Just Works as-is.
 
-**c. Skip metadata entirely** — totally fine. In *Configure prompts* you can compose prompts from the file path (e.g. `/sfx/explosions/fireworks/03.wav` becomes the prompt — folder structure becomes meaning), or a fixed string for every clip, or both mixed.
+**c. Embedded audio tags** (ID3 on MP3, Vorbis on FLAC/OGG, M4A atoms, etc.) — read via the `audio_metadata` library. For example: `title`, `artist`, `album`, `genre`, `label`, `date`, `composer`, `bpm`. If your music library is already tagged in Picard / Mp3tag, you get those for free.
+
+**d. Skip metadata entirely** — totally fine. In *Configure prompts* you can compose prompts from the file path (e.g. `/sfx/explosions/fireworks/03.wav` becomes the prompt — folder structure becomes meaning), or a fixed string for every clip, or both mixed.
 
 ### 3. Create a dataset
 
