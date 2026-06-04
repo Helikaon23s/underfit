@@ -89,6 +89,7 @@ MODELS_DIR = Path(os.environ.get(
     "UNDERFIT_MODELS_DIR", STATE_DIR / "models"
 )).expanduser()
 RUNS_FILE = STATE_FILES_DIR / "runs.json"
+HOST = os.environ.get("UNDERFIT_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("UNDERFIT_DASHBOARD_PORT", 8787))
 DEMO_STEPS = 50
 DEMO_CFG_SCALES = [7]
@@ -7405,7 +7406,7 @@ if __name__ == "__main__":
     bind_port = PORT
     for offset in range(50):
         try:
-            server = ThreadedHTTPServer(("0.0.0.0", bind_port + offset), DashboardHandler)
+            server = ThreadedHTTPServer((HOST, bind_port + offset), DashboardHandler)
             if offset:
                 print(f"Port {PORT} taken — using {bind_port + offset} instead.")
             break
@@ -7415,5 +7416,5 @@ if __name__ == "__main__":
     if server is None:
         raise RuntimeError(f"Could not find a free port in {PORT}..{PORT + 49}")
     actual_port = server.server_address[1]
-    print(f"Dashboard running on http://0.0.0.0:{actual_port}")
+    print(f"Dashboard running on http://{HOST}:{actual_port}")
     server.serve_forever()
