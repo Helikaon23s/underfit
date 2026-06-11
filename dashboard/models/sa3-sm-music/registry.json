@@ -19,6 +19,10 @@
     "arc_config": "{models_dir}/sa3-sm-music/arc/model_config.json",
     "arc_ckpt": "{models_dir}/sa3-sm-music/arc/model.safetensors"
   },
+  "hf_repo": {
+    "arc":  "stabilityai/stable-audio-3-small-music",
+    "base": "stabilityai/stable-audio-3-small-music-base"
+  },
   "arc": {
     "type": "full_model"
   },

@@ -176,6 +176,45 @@ def _ensure_model_alias(alias_path, target_path):
                 return
         print(f"[models] couldn't link {alias_path} -> {target_path}: {symlink_error}")
 
+def _hf_hub_cache_dir():
+    """Path to the HuggingFace hub cache, honoring HUGGINGFACE_HUB_CACHE / HF_HOME."""
+    explicit = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if explicit:
+        return Path(explicit).expanduser()
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+def _ensure_hf_snapshot_link(target_dir, repo_id):
+    """If target_dir is absent, symlink it to the local HF snapshot for repo_id.
+    Idempotent. Leaves existing files/links untouched (don't second-guess user
+    overrides). Logs a clear message when the model isn't in the cache."""
+    target_dir = Path(target_dir)
+    if target_dir.exists() or target_dir.is_symlink():
+        return
+    cache_root = _hf_hub_cache_dir() / f"models--{repo_id.replace('/', '--')}"
+    refs_main = cache_root / "refs" / "main"
+    if not refs_main.is_file():
+        print(f"[models] {target_dir}: HF cache empty for {repo_id} — run "
+              f"`huggingface-cli download {repo_id}` to populate")
+        return
+    try:
+        snapshot_hash = refs_main.read_text().strip()
+    except OSError as e:
+        print(f"[models] {target_dir}: couldn't read {refs_main}: {e}")
+        return
+    snapshot_dir = cache_root / "snapshots" / snapshot_hash
+    if not (snapshot_dir / "model_config.json").is_file():
+        print(f"[models] {target_dir}: snapshot {snapshot_hash} missing "
+              f"model_config.json — re-run `huggingface-cli download {repo_id}`")
+        return
+    try:
+        target_dir.symlink_to(snapshot_dir)
+        print(f"[models] linked {target_dir} -> {snapshot_dir}")
+    except OSError as e:
+        print(f"[models] couldn't link {target_dir} -> {snapshot_dir}: {e}")
+
 def _load_models_from_json():
     """Walk dashboard/models/*/registry.json and merge into MODEL_INFO / ENCODING_MODELS / SHARED_ENCODERS."""
     if not MODELS_SHIPPED_DIR.is_dir():
@@ -223,6 +262,17 @@ def _load_models_from_json():
         # (e.g. pre_encode.py reads MODELS_DIR/<key>/{config,ckpt}).
         _model_dir = MODELS_DIR / key
         _model_dir.mkdir(parents=True, exist_ok=True)
+
+        # Self-heal: if arc/base dir-symlinks are missing but the model lives
+        # in the local HF cache, link them. Lets users who blew away the
+        # symlinks (or never ran the installer's linker) launch without
+        # hand-fixing each model. No-op when the dirs already exist.
+        _hf_repos = m.get("hf_repo") or {}
+        for _sub in ("arc", "base"):
+            _repo = _hf_repos.get(_sub)
+            if _repo:
+                _ensure_hf_snapshot_link(_model_dir / _sub, _repo)
+
         _link_specs = [
             ("config",     paths.get("base_config")),
             ("ckpt",       paths.get("base_ckpt")),
