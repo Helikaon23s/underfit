@@ -1,6 +1,6 @@
 # underfit
 
-**The superuser LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium).**
+**The power-user LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium).**
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb)  ![python](https://img.shields.io/badge/python-3.10-blue)  ![license](https://img.shields.io/badge/license-MIT-green)
 
