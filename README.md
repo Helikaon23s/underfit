@@ -225,9 +225,9 @@ In the dashboard's checkpoints list, click the download (⬇) button — or grab
 
 ## Run inference with your LoRA
 
-### From the dashboard - Currently not working on this version
+### From the dashboard 
 
-Currently not working - Click [Launch] on any checkpoint. Spins up a private Gradio link. Knobs:
+Click [Launch] on any checkpoint. Spins up a private Gradio link. Knobs:
 
 - **LoRA strength <1.0** — blends LoRA with base model. A heavily-trained / "memorised" checkpoint often sounds best around 0.6–0.8 — gives you "in the style of" without straight regurgitation.
 - **LoRA interval (skip first step)** — the very first denoising step establishes song structure, so skipping the LoRA here prevents it from regurgitating any song. Instead the base model determines the song structure fron the prompt. 
