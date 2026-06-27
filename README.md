@@ -1,6 +1,6 @@
 # underfit
 
-**The power-user LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium).**
+**The power-user LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium) in Windows.**
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb)  ![python](https://img.shields.io/badge/python-3.10-blue)  ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -35,7 +35,7 @@ Open the URL in a browser, click **+ New Dataset** to star
 
 |                | |
 |---             |---|
-| **OS**         | (Windows tested with 24 GB vram 4090.) |
+| **OS**         | (Windows tested with 24 GB vram 4090 in Windows 11.) |
 | **GPU**        | NVIDIA. ≥16 GB VRAM ideal. 8 GB still works with minimal settings: fp16 base model + low rank + small latent crop + batch 1 |
 | **Python**     | 3.10 (auto-fetched by `uv`). |
 | **Disk**       | Plan for ~17 GB per SA3-medium pack, ~7 GB per small pack. All three = ~31 GB of checkpoints. Datasets add a few hundred MB each. |
