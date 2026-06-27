@@ -24,7 +24,7 @@ Open the URL in a browser, click **+ New Dataset** to star
 
 > **First time only** — open https://huggingface.co/stabilityai/stable-audio-3-medium and click *Agree and access repository*. The three SA3 ARC repos share one license; one click unlocks all three. Approval is instant. Without it the install fails with `401 Unauthorized` on the ARC checkpoint downloads. (The base checkpoints aren't gated.)
 
-> KNOWN ISSUES with Windows Version - 1. clicking the Launch button next to each checkpoint will not launch Stable Audio 3   2. manual Save Checkpoint button does not work 3. colab not tested - txt removed from below 
+> KNOWN ISSUES with Windows Version - 1. manual Save Checkpoint button does not work 2.colab not tested - txt removed from below 
 
 > Linux only code changed to Windows , Remote not tested / comments removed , added lines to run.bat to show that gpu torch is installed ok
 
