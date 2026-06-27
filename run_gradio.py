@@ -63,7 +63,7 @@ def main(args):
     )
     interface.queue()
     interface.launch(
-        share=True,
+        share=False,
         auth=(args.username, args.password) if args.username is not None else None,
         js=getattr(interface, "_sao_js", None),
         theme=getattr(interface, "_sao_theme", None),
