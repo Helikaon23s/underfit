@@ -425,15 +425,33 @@ def run_training(args, backend):
     lbt_log = _LossByTimestepLog(os.path.join(os.getcwd(), "loss_by_timestep.bin"))
 
     # --- SIGUSR1 manual save ---
+    # --- Manual Save Trigger (Cross-Platform) ---
     manual_save_requested = [False]
-    def _request_save(*_):
+    trigger_files = ["save_checkpoint.tmp", ".save_checkpoint.signal"]
+
+    def _request_save(signum=None, frame=None):
         manual_save_requested[0] = True
-        print("\n[SIGUSR1] Checkpoint save requested — will save after current step", flush=True)
-    sigusr1 = getattr(signal, "SIGUSR1", None)
-    if sigusr1 is not None:
-        signal.signal(sigusr1, _request_save)
-    else:
-        print("[startup] SIGUSR1 unavailable; manual checkpoint signal disabled", flush=True)
+        print("\n[SAVE_REQUESTED] Checkpoint save requested — will save after current step", flush=True)
+
+    # 1. Standard POSIX signal (Linux/macOS)
+    if hasattr(signal, 'SIGUSR1'):
+        try:
+            signal.signal(signal.SIGUSR1, _request_save)
+        except Exception:
+            pass
+
+    # 2. Windows-compatible signal (Ctrl+Break)
+    if hasattr(signal, 'SIGBREAK'):
+        try:
+            signal.signal(signal.SIGBREAK, _request_save)
+        except Exception:
+            pass
+
+    # 3. Fallback: Watch for a trigger file created by the dashboard on Windows
+    #    We look in the current working directory (usually the run's output dir)
+    import tempfile
+    _trigger_dir = tempfile.gettempdir()
+    _trigger_paths = [os.path.join(_trigger_dir, f) for f in trigger_files]
 
     # --- Training loop ---
     diffusion_objective = model.diffusion_objective
@@ -655,6 +673,15 @@ def run_training(args, backend):
                 # demo generation crashes or stalls). Aligned with global_step
                 # so saves happen at clean multiples of save_every regardless
                 # of step_offset from a resume.
+                
+                 # --- Check for manual save trigger (Dashboard/Windows fallback) ---
+                for tf_path in _trigger_paths:
+                    if os.path.exists(tf_path):
+                        manual_save_requested[0] = True
+                        os.remove(tf_path)  # Consume the trigger
+                        print(f"[SAVE_TRIGGERED] Found trigger file, requesting save.", flush=True)
+                        break                               
+                
                 save_now = manual_save_requested[0] or (
                     global_step > 0 and global_step % save_every == 0
                 )
