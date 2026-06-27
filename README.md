@@ -1,4 +1,4 @@
-# underfit
+# underfit for windows
 
 **The power-user LoRA dashboard for making custom finetunes of [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-medium) in Windows.**
 
@@ -12,9 +12,9 @@
 
 ## Quickstart — local GPU box
 
-Linux box with an NVIDIA GPU, `git`, and `curl`. Everything else gets fetched automatically.
+Windows pc with an NVIDIA GPU, `git`, and `curl`. Everything else gets fetched automatically.
 
-```bash
+```
 git clone https://github.com/dada-bots/underfit && cd underfit
 ./install.bat                            # ~5 min: installs uv, syncs deps, clones SA3, downloads model packs
 ./run.bat                                # serves the dashboard on http://localhost:8787
