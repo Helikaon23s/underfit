@@ -11,6 +11,140 @@ import shutil
 import signal
 import subprocess
 import sys
+import psutil
+
+# ── Windows compatibility ────────────────────────────────────────────────────
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes
+
+    # os.setsid / os.getpgid / os.killpg / os.readlink are POSIX-only.
+    # Provide no-op / best-effort replacements so the rest of the code runs.
+    def _dummy_setsid(): pass
+    os.setsid = _dummy_setsid
+
+    def _win_getpgid(pid): return pid          # no process groups on Windows
+    os.getpgid = _win_getpgid
+
+    def _win_killpg(pgid, sig):
+        """Best-effort: terminate the process by PID (pgid == pid on Windows)."""
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/F", "/PID", str(pgid)], capture_output=True)
+        except Exception:
+            pass
+    os.killpg = _win_killpg
+
+    if not hasattr(os, "readlink"):
+        def _dummy_readlink(path): raise NotImplementedError("readlink not available on Windows")
+        os.readlink = _dummy_readlink
+
+    # Windows uses CREATE_NEW_PROCESS_GROUP instead of setsid for job isolation
+    _SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+else:
+    _IS_WINDOWS = False
+    _SUBPROCESS_KWARGS = {"preexec_fn": os.setsid}
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _make_win_launch(python_exe, env_vars, cwd, args, log_path):
+    """Windows replacement for the bash pipeline `source venv && VAR=val python3 ... 2>&1 | tee log`.
+
+    Launches python_exe directly (no bash needed) with env_vars merged into
+    the current environment, stdout+stderr tee'd to log_path via a thread.
+    Returns proc.
+    """
+    import threading
+
+    env = os.environ.copy()
+    env.update({k: str(v) for k, v in env_vars.items()})
+    env["PYTHONUNBUFFERED"] = "1"
+
+    log_file = open(log_path, "w", encoding="utf-8", errors="replace", buffering=1)
+
+    proc = subprocess.Popen(
+        [python_exe] + [str(a) for a in args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=str(cwd) if cwd else None,
+        **_SUBPROCESS_KWARGS,
+    )
+
+    def _tee():
+        try:
+            for raw_line in proc.stdout:
+                text = raw_line.decode("utf-8", errors="replace")
+                log_file.write(text)
+                log_file.flush()
+        finally:
+            log_file.close()
+
+    threading.Thread(target=_tee, daemon=True).start()
+    return proc
+
+
+def _find_venv_python():
+    """Return the Python executable for the current venv (cross-platform)."""
+    return sys.executable
+
+
+def _parse_training_env_and_args(launch_cmd_str, log_path):
+    """Parse a bash launch_cmd string into (env_dict, args_list, cwd) for Windows.
+
+    The bash template looks like:
+      source VENV && cd DEMO_DIR && PYTHONUNBUFFERED=1 MPLBACKEND=Agg VAR=val ... python3 script --args
+    We extract the env vars and the python3 ... portion as an arg list.
+    """
+    env = {}
+    args = []
+    cwd = None
+
+    # Pull out "cd <dir>"
+    import re as _re
+    cd_m = _re.search(r"(?:^|&&\s*)cd\s+(\S+)", launch_cmd_str)
+    if cd_m:
+        cwd = cd_m.group(1).strip("'\"")
+
+    # Find the python3 invocation (everything from python3 onward)
+    py_idx = launch_cmd_str.find("python3 ")
+    if py_idx == -1:
+        py_idx = launch_cmd_str.find("python ")
+    if py_idx == -1:
+        return env, args, cwd
+
+    # Everything before python3 that looks like VAR=val
+    pre = launch_cmd_str[:py_idx]
+    for m in _re.finditer(r'(\w+)=([^\s]+)', pre):
+        k, v = m.group(1), m.group(2)
+        if k not in ("source",):
+            env[k] = v.strip("'\"")
+
+    # The python3 invocation — strip trailing 2>&1 | tee ... pipe
+    py_part = launch_cmd_str[py_idx:]
+    pipe_idx = py_part.find(" 2>&1")
+    if pipe_idx != -1:
+        py_part = py_part[:pipe_idx]
+    pipe_idx2 = py_part.find(" | tee")
+    if pipe_idx2 != -1:
+        py_part = py_part[:pipe_idx2]
+
+    # Parse into a list, replacing leading "python3" with the venv python
+    import shlex as _shlex
+    raw = _shlex.split(py_part.strip())
+    if raw and raw[0] in ("python3", "python"):
+        raw[0] = _find_venv_python()
+    args = raw
+
+    # Always set these
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("MPLBACKEND", "Agg")
+    env["UNDERFIT_LOG_PATH"] = log_path
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"    
+    return env, args, cwd
+
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -33,24 +167,15 @@ BASE_DIR = Path(__file__).parent.parent
 DASHBOARD_DIR = Path(__file__).parent
 
 # Writable user state — runs.json/datasets.json, per-run outputs, generated
-# audio, checkpoint symlinks, gradio logs.
-# Discovery order: UNDERFIT_STATE_DIR env > cwd if it already holds runs.json
-# (so `cd dashboard && server.py` Just Works) > <repo>/state/ default.
-def _resolve_state_dir():
-    env = os.environ.get("UNDERFIT_STATE_DIR")
-    if env:
-        return Path(env).expanduser()
-    cwd = Path.cwd()
-    if (cwd / "runs.json").is_file():
-        return cwd
-    return BASE_DIR / "state"
-STATE_DIR = _resolve_state_dir()
+# audio, checkpoint symlinks, gradio logs. Defaults to <repo>/state/ for a
+# clean separation from the code in dashboard/. Override with UNDERFIT_STATE_DIR
+# to relocate (e.g. ~/.underfit, persistent volume in Colab).
+STATE_DIR = Path(os.environ.get("UNDERFIT_STATE_DIR", BASE_DIR / "state")).expanduser()
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Tracked, ship-with-the-repo paths
 MODELS_SHIPPED_DIR = DASHBOARD_DIR / "models"   # per-model {registry.json, training_template.json}
 PRE_DIR = BASE_DIR / "dataset_processing"       # autotagger, pre_encode, metadata helpers
-IS_WINDOWS = os.name == "nt"
 
 # Per-instance runtime paths (under STATE_DIR)
 RUNS_DIR = STATE_DIR / "runs"                   # per-run checkpoints, configs, demos — durable, on Drive in Colab
@@ -97,7 +222,6 @@ MODELS_DIR = Path(os.environ.get(
     "UNDERFIT_MODELS_DIR", STATE_DIR / "models"
 )).expanduser()
 RUNS_FILE = STATE_FILES_DIR / "runs.json"
-HOST = os.environ.get("UNDERFIT_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("UNDERFIT_DASHBOARD_PORT", 8787))
 DEMO_STEPS = 50
 DEMO_CFG_SCALES = [7]
@@ -153,68 +277,6 @@ def _resolve_paths(obj, substitutions):
         return obj
     return obj
 
-def _ensure_model_alias(alias_path, target_path):
-    """Create a stable per-model alias, using hardlinks on Windows when symlinks
-    are unavailable."""
-    alias_path = Path(alias_path)
-    target_path = Path(target_path)
-    if alias_path.is_symlink() or alias_path.exists() or not target_path.exists():
-        return
-    try:
-        alias_path.symlink_to(target_path)
-        return
-    except OSError as symlink_error:
-        if IS_WINDOWS and target_path.is_file():
-            try:
-                os.link(target_path, alias_path)
-                return
-            except OSError as hardlink_error:
-                print(
-                    f"[models] couldn't link {alias_path} -> {target_path}: "
-                    f"{symlink_error}; hardlink failed: {hardlink_error}"
-                )
-                return
-        print(f"[models] couldn't link {alias_path} -> {target_path}: {symlink_error}")
-
-def _hf_hub_cache_dir():
-    """Path to the HuggingFace hub cache, honoring HUGGINGFACE_HUB_CACHE / HF_HOME."""
-    explicit = os.environ.get("HUGGINGFACE_HUB_CACHE")
-    if explicit:
-        return Path(explicit).expanduser()
-    hf_home = os.environ.get("HF_HOME")
-    if hf_home:
-        return Path(hf_home).expanduser() / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
-
-def _ensure_hf_snapshot_link(target_dir, repo_id):
-    """If target_dir is absent, symlink it to the local HF snapshot for repo_id.
-    Idempotent. Leaves existing files/links untouched (don't second-guess user
-    overrides). Logs a clear message when the model isn't in the cache."""
-    target_dir = Path(target_dir)
-    if target_dir.exists() or target_dir.is_symlink():
-        return
-    cache_root = _hf_hub_cache_dir() / f"models--{repo_id.replace('/', '--')}"
-    refs_main = cache_root / "refs" / "main"
-    if not refs_main.is_file():
-        print(f"[models] {target_dir}: HF cache empty for {repo_id} — run "
-              f"`huggingface-cli download {repo_id}` to populate")
-        return
-    try:
-        snapshot_hash = refs_main.read_text().strip()
-    except OSError as e:
-        print(f"[models] {target_dir}: couldn't read {refs_main}: {e}")
-        return
-    snapshot_dir = cache_root / "snapshots" / snapshot_hash
-    if not (snapshot_dir / "model_config.json").is_file():
-        print(f"[models] {target_dir}: snapshot {snapshot_hash} missing "
-              f"model_config.json — re-run `huggingface-cli download {repo_id}`")
-        return
-    try:
-        target_dir.symlink_to(snapshot_dir)
-        print(f"[models] linked {target_dir} -> {snapshot_dir}")
-    except OSError as e:
-        print(f"[models] couldn't link {target_dir} -> {snapshot_dir}: {e}")
-
 def _load_models_from_json():
     """Walk dashboard/models/*/registry.json and merge into MODEL_INFO / ENCODING_MODELS / SHARED_ENCODERS."""
     if not MODELS_SHIPPED_DIR.is_dir():
@@ -262,17 +324,6 @@ def _load_models_from_json():
         # (e.g. pre_encode.py reads MODELS_DIR/<key>/{config,ckpt}).
         _model_dir = MODELS_DIR / key
         _model_dir.mkdir(parents=True, exist_ok=True)
-
-        # Self-heal: if arc/base dir-symlinks are missing but the model lives
-        # in the local HF cache, link them. Lets users who blew away the
-        # symlinks (or never ran the installer's linker) launch without
-        # hand-fixing each model. No-op when the dirs already exist.
-        _hf_repos = m.get("hf_repo") or {}
-        for _sub in ("arc", "base"):
-            _repo = _hf_repos.get(_sub)
-            if _repo:
-                _ensure_hf_snapshot_link(_model_dir / _sub, _repo)
-
         _link_specs = [
             ("config",     paths.get("base_config")),
             ("ckpt",       paths.get("base_ckpt")),
@@ -282,7 +333,13 @@ def _load_models_from_json():
         for _sym, _real in _link_specs:
             if not _real:
                 continue
-            _ensure_model_alias(_model_dir / _sym, _real)
+            _sympath = _model_dir / _sym
+            if _sympath.is_symlink() or _sympath.exists():
+                continue
+            try:
+                _sympath.symlink_to(_real)
+            except OSError as _e:
+                print(f"[models] couldn't link {_sympath} -> {_real}: {_e}")
 
         # ENCODING_MODELS description
         if "description" in m:
@@ -417,35 +474,19 @@ def _missing_backend_error_for_model(model_key):
 # Gradio launch constants. VENV_ACTIVATE is autodetected from the running
 # Python's parent dir (so `source <bin>/activate` works for whichever venv
 # the dashboard was launched from). Override with UNDERFIT_VENV_ACTIVATE.
-VENV_ACTIVATE = os.environ.get(
-    "UNDERFIT_VENV_ACTIVATE",
-    str(Path(sys.executable).parent / "activate"),
-)
-VENV_PYTHON = Path(os.environ.get(
-    "UNDERFIT_VENV_PYTHON",
-    BASE_DIR / ".venv" / ("Scripts/python.exe" if IS_WINDOWS else "bin/python"),
-)).expanduser()
-if not VENV_PYTHON.exists():
-    VENV_PYTHON = Path(sys.executable)
-
-
-def _bash_path(value):
-    s = str(value)
-    return s.replace("\\", "/") if IS_WINDOWS else s
-
-
-def _bash_quote(value):
-    return shlex.quote(_bash_path(value))
-
-
-def _app_path(value):
-    p = Path(value)
-    return p if p.is_absolute() else (BASE_DIR / p).resolve()
-
-
-PYTHON_UTF8_ENV = "PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "
-
-
+# On Windows the activate script lives in Scripts\ not bin/.
+# NOTE: VENV_ACTIVATE is only used in the Linux bash-c paths; Windows
+# uses _find_venv_python() / _make_win_launch() which need no activation.
+if _IS_WINDOWS:
+    VENV_ACTIVATE = os.environ.get(
+        "UNDERFIT_VENV_ACTIVATE",
+        str(Path(sys.executable).parent / "activate.bat"),
+    )
+else:
+    VENV_ACTIVATE = os.environ.get(
+        "UNDERFIT_VENV_ACTIVATE",
+        str(Path(sys.executable).parent / "activate"),
+    )
 # Path to the stable-audio-tools checkout (used by the sat backend to
 # read its defaults.ini). Defaults to a sibling clone next to underfit —
 # the location where `underfit-setup --backend sat` clones to. Override
@@ -483,58 +524,63 @@ def _dataset_for_step(dataset_history, step):
 def _detect_process_state(pid):
     """Return 'running', 'paused', or 'dead'.
 
-    Zombies (state 'Z') are treated as dead — they linger in the process
-    table until reaped, but they're not doing anything. os.kill(pid, 0)
-    succeeds against zombies, so we have to check /proc/<pid>/status to
-    distinguish.
+    On Windows, /proc does not exist; use psutil if available, else use
+    OpenProcess via ctypes to check whether the PID is still alive.
+    os.kill(pid, 0) is unreliable on Windows for dead processes.
     """
     if pid is None:
         return "dead"
-    if IS_WINDOWS:
+    if _IS_WINDOWS:
+        # Use psutil if available (most reliable)
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = [
-                wintypes.DWORD,
-                wintypes.BOOL,
-                wintypes.DWORD,
-            ]
-            kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.GetExitCodeProcess.argtypes = [
-                wintypes.HANDLE,
-                ctypes.POINTER(wintypes.DWORD),
-            ]
-            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-
-            process_query_limited_information = 0x1000
-            still_active = 259
-            handle = kernel32.OpenProcess(
-                process_query_limited_information,
-                False,
-                int(pid),
-            )
+            import psutil
+            try:
+                p = psutil.Process(pid)
+                st = p.status()
+                if st == psutil.STATUS_ZOMBIE:
+                    return "dead"
+                return "running"
+            except psutil.NoSuchProcess:
+                return "dead"
+            except Exception:
+                pass
+        except ImportError:
+            pass
+        # Fallback: OpenProcess then check exit code via ctypes
+        try:
+            import ctypes, ctypes.wintypes
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not handle:
                 return "dead"
             try:
-                exit_code = wintypes.DWORD()
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                    return "dead"
-                return "running" if exit_code.value == still_active else "dead"
+                exit_code = ctypes.wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    # STILL_ACTIVE = 259
+                    return "running" if exit_code.value == 259 else "dead"
             finally:
                 kernel32.CloseHandle(handle)
         except Exception:
-            return "dead"
+            pass
+        # Last resort: tasklist
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=3
+            ).stdout
+            return "running" if str(pid) in out else "dead"
+        except Exception:
+            pass
+        return "dead"  # assume dead if all checks fail
+    # POSIX path: original logic unchanged
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return "dead"
     except PermissionError:
         pass  # process exists but we can't signal — it's alive
-    # Check /proc/{pid}/status for stopped/zombie state
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
@@ -550,50 +596,26 @@ def _detect_process_state(pid):
     return "running"
 
 
-def _popen_managed(args, **kwargs):
-    """Launch a child process in a separately controllable process group."""
-    if IS_WINDOWS:
-        kwargs["creationflags"] = (
-            kwargs.get("creationflags", 0) |
-            subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        kwargs.setdefault("preexec_fn", os.setsid)
-    return subprocess.Popen(args, **kwargs)
-
-
-def _signal_process_group(pid, sig):
-    if IS_WINDOWS:
-        raise NotImplementedError("pause/resume is not supported on Windows")
-    pgid = os.getpgid(pid) if _detect_process_state(pid) != "dead" else pid
-    os.killpg(pgid, sig)
-
-
 def _kill_process_group(pid, paused=False):
     """Kill an entire process group by PID. Handles orphaned children.
 
-    Since we launch with os.setsid(), the stored PID is the session/group leader.
-    Even if the bash wrapper is dead, orphaned children keep the same PGID,
-    so we can signal the group directly via os.killpg(pid, ...) since pid == pgid.
-    Uses SIGKILL directly — PyTorch/Lightning catches SIGTERM and delays exit.
+    On Linux: uses os.setsid() + os.killpg() for true process-group kill.
+    On Windows: falls back to taskkill /F /T which kills the process tree.
     """
-    if IS_WINDOWS:
+    if _IS_WINDOWS:
         try:
             subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
             )
         except Exception as e:
-            print(f"[control] taskkill failed for PID {pid}: {e}")
+            print(f"[control] taskkill for PID {pid} failed: {e}")
         return
 
-    # Try to get the actual PGID (works if leader is still alive)
+    # POSIX path: original logic unchanged
     try:
         pgid = os.getpgid(pid)
     except (ProcessLookupError, PermissionError):
-        # Leader dead — but pid == pgid because we used os.setsid()
         pgid = pid
     try:
         if paused:
@@ -611,28 +633,31 @@ def _free_gpu_memory(gpu):
     if gpu is None:
         return
     try:
-        cmd = (
-            f"CUDA_VISIBLE_DEVICES={gpu} python3 -c "
-            "'import torch; torch.cuda.empty_cache(); print(\"VRAM freed on GPU\", {gpu})'"
-        )
-        subprocess.Popen(
-            ["bash", "-c", f"source {_bash_quote(VENV_ACTIVATE)} && {cmd}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        if _IS_WINDOWS:
+            env = os.environ.copy()
+            if gpu is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            subprocess.Popen(
+                [_find_venv_python(), "-c",
+                 f"import torch; torch.cuda.empty_cache(); print('VRAM freed on GPU {gpu}')"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        else:
+            cmd = (
+                f"CUDA_VISIBLE_DEVICES={gpu} python3 -c "
+                "'import torch; torch.cuda.empty_cache(); print(\"VRAM freed on GPU\", {gpu})'"
+            )
+            subprocess.Popen(
+                ["bash", "-c", f"source {VENV_ACTIVATE} && {cmd}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
     except Exception as e:
         print(f"[cleanup] cuda.empty_cache failed for GPU {gpu}: {e}")
 
 
 def _diagnose_quick_kill(run: dict) -> str | None:
-    """Return a one-line hint about why a run died, or None if no signal.
-
-    Checks in priority order:
-      1. `<log>.exit` — written by lora_train.py's global try/except. Has the
-         actual Python exception + traceback, robust to pipe/buffering issues.
-      2. `<log>.bash.err` — bash's own stderr (source-failures, shell syntax,
-         etc.). Rare but extremely useful when it fires.
-      3. Elapsed <30 s + tiny log → SIGKILL (OOM-killer) heuristic.
-    """
+    """Return a one-line hint about why a run died, or None if no signal."""
     log_path = run.get("log_path") or ""
 
     # 1. Python exit sidecar (highest signal)
@@ -642,13 +667,11 @@ def _diagnose_quick_kill(run: dict) -> str | None:
             with open(exit_path, "rb") as f:
                 exit_txt = f.read(4096).decode("utf-8", errors="replace").strip()
             first = exit_txt.splitlines()[0][:250] if exit_txt else ""
-            if first:
-                return first
-
+            if first: return first
         except OSError:
             pass
 
-    # 2. Bash-level error
+    # 2. Bash/Shell level error
     bash_err = log_path + ".bash.err"
     if os.path.exists(bash_err):
         try:
@@ -660,16 +683,11 @@ def _diagnose_quick_kill(run: dict) -> str | None:
         except OSError:
             pass
 
-    # 3. Did lora_train.py even reach __main__?
+    # 3. Did training reach __main__?
     started_path = log_path + ".started"
-    reached_python = os.path.exists(started_path)
-    if log_path and not reached_python:
-        # No marker means bash died before python ran. Most likely: bad venv path,
-        # source failure, missing executable, or shell-quoting bug. Should already
-        # have shown up in .bash.err above, but if not, this is the next-best clue.
-        return ("Process never reached python (no '.started' marker) — bash / "
-                "venv / source failed silently. Inspect <log>.bash.err if it "
-                "exists, or try the run's restart_cmd manually.")
+    if log_path and not os.path.exists(started_path):
+        return ("Process never reached python (no '.started' marker) — initialization failed silently. "
+                "Inspect the logs or run your setup configuration payload manually.")
 
     # 4. Quick death with empty log → OOM-killer heuristic
     elapsed = None
@@ -679,16 +697,22 @@ def _diagnose_quick_kill(run: dict) -> str | None:
             elapsed = time.time() - datetime.fromisoformat(ts).timestamp()
     except Exception:
         pass
+        
     log_size = 0
     if log_path:
         try:
             log_size = os.path.getsize(log_path)
         except OSError:
             pass
+            
     if elapsed is not None and elapsed < 30 and log_size < 200:
-        return ("Process died in <30 s with no output — almost certainly SIGKILL "
-                "from the kernel OOM-killer. Check `dmesg | tail` for "
-                "'Killed process …', or try a smaller batch size / model.")
+        if _IS_WINDOWS:
+            return ("Process died in <30 s with no output — likely a system OOM (Out Of Memory) event. "
+                    "Check Windows Event Viewer (System Logs) or lower your batch size.")
+        else:
+            return ("Process died in <30 s with no output — almost certainly SIGKILL "
+                    "from the kernel OOM-killer. Check `dmesg | tail` for "
+                    "'Killed process …', or try a smaller batch size / model.")
     return None
 
 
@@ -777,8 +801,6 @@ def _process_log_lines(raw):
     new adjacent progress bars)."""
     lines = []
     for chunk in raw.split(b"\n"):
-        if chunk.endswith(b"\r"):
-            chunk = chunk[:-1]
         if b"\r" in chunk:
             chunk = chunk.rsplit(b"\r", 1)[-1]
         lines.append(chunk.decode("utf-8", errors="replace"))
@@ -1099,24 +1121,32 @@ def _find_json_sidecar(fpath, json_map=None):
 
 
 def _read_audio_tags(fpath, json_map=None):
-    """Read metadata tags from an audio file.
+    """Read metadata tags from an audio file. Priority: JSON/TXT sidecar > embedded tags."""
+    p_fpath = Path(fpath)
+    
+    # 1. Check for a raw text caption sidecar (.txt)
+    txt_sidecar = p_fpath.with_suffix(".txt")
+    if txt_sidecar.exists():
+        try:
+            prompt_text = txt_sidecar.read_text(encoding="utf-8", errors="replace").strip()
+            if prompt_text:
+                # Return it as a title/prompt string matching the dataset expectations
+                return {"title": prompt_text}
+        except Exception:
+            pass
 
-    Priority: JSON sidecar ({stem}.json) > embedded tags.
-    The sidecar is created by autotagger.py for files without embedded tags.
-    For embedded: MP4 uses mutagen directly (fast), ID3 uses audio_metadata first.
-    """
-    # Check for JSON sidecar first (same dir or cross-directory)
+    # 2. Check for JSON sidecar first (original fallback logic)
     sidecar = _find_json_sidecar(fpath, json_map)
     if sidecar:
         try:
             with open(sidecar) as f:
                 sc = json.load(f)
-            sc_tags = {}
-            for key, val in sc.items():
-                if val and isinstance(val, (str, int, float)):
-                    sc_tags[key] = str(val)
-            if sc_tags:
-                return sc_tags
+                sc_tags = {}
+                for key, val in sc.items():
+                    if val and isinstance(val, (str, int, float)):
+                        sc_tags[key] = str(val)
+                if sc_tags:
+                    return sc_tags
         except Exception:
             pass
 
@@ -1455,7 +1485,6 @@ class GradioManager:
         with self._lock:
             instance_id = uuid.uuid4().hex[:12]
             port = self._find_available_port()
-            checkpoint_path = _bash_path(_app_path(checkpoint_path))
             if not title:
                 title = checkpoint_name or Path(checkpoint_path).name
             # Resolve base model from run record
@@ -1506,11 +1535,7 @@ class GradioManager:
                             pass
                         break
 
-            lora_args = (
-                f"--lora-ckpt-path {_bash_quote(arc_lora_path)} {_bash_quote(checkpoint_path)}"
-                if arc_lora_path else
-                f"--lora-ckpt-path {_bash_quote(checkpoint_path)}"
-            )
+            lora_args = f"--lora-ckpt-path {arc_lora_path} {checkpoint_path}" if arc_lora_path else f"--lora-ckpt-path {checkpoint_path}"
             verbose_arg = " --verbose" if verbose else ""
             thread_env = (
                 "OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 "
@@ -1520,33 +1545,60 @@ class GradioManager:
             # MPLBACKEND=Agg overrides Colab's inherited
             # 'module://matplotlib_inline.backend_inline' which is invalid in
             # a non-IPython subprocess (matplotlib crashes on import).
-            cmd = (
-                f"source {_bash_quote(VENV_ACTIVATE)} && "
-                f"{backend_env}CUDA_VISIBLE_DEVICES={gpu} GRADIO_SERVER_PORT={port} "
-                f"PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
-                f"{thread_env}"
-                f"python {_bash_quote(RUN_GRADIO_SCRIPT)} "
-                f"--model-config {_bash_quote(config_path_model)} "
-                f"--ckpt-path {_bash_quote(ckpt_path_model)} "
-                f"{lora_args} "
-                f"--model-half "
-                f"--title {shlex.quote(title)}"
-                f"{default_prompt_arg}"
-                f"{verbose_arg}"
-            )
             log_path = str(GRADIO_LOG_DIR / f"{instance_id}.log")
-            log_file = open(log_path, "w")
-            try:
-                proc = _popen_managed(
-                    ["bash", "-c", cmd],
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+            # Parse lora args back to a list (they were built as a string above)
+            lora_args_list = lora_args.split()
+            default_prompt_list = shlex.split(default_prompt_arg.strip()) if default_prompt_arg.strip() else []
+            verbose_list = ["--verbose"] if verbose else []
+            if _IS_WINDOWS:
+                # Build env-var dict from the inline-shell strings
+                win_env = {"CUDA_VISIBLE_DEVICES": str(gpu),
+                           "GRADIO_SERVER_PORT": str(port),
+                           "MPLBACKEND": "Agg"}
+                if backend_env.strip():
+                    k, v = backend_env.strip().split("=", 1)
+                    win_env[k] = v
+                if GRADIO_THREAD_CAP:
+                    win_env.update({"OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4",
+                                    "OPENBLAS_NUM_THREADS": "4", "NUMEXPR_NUM_THREADS": "4",
+                                    "RAYON_NUM_THREADS": "4", "TOKENIZERS_PARALLELISM": "false"})
+                win_args = [
+                    RUN_GRADIO_SCRIPT,
+                    "--model-config", config_path_model,
+                    "--ckpt-path", ckpt_path_model,
+                ] + lora_args_list + ["--model-half", "--title", title] + default_prompt_list + verbose_list
+                try:
+                    proc = _make_win_launch(_find_venv_python(), win_env, None, win_args, log_path)
+                except Exception as e:
+                    return None, str(e)
+            else:
+                cmd = (
+                    f"source {VENV_ACTIVATE} && "
+                    f"{backend_env}CUDA_VISIBLE_DEVICES={gpu} GRADIO_SERVER_PORT={port} "
+                    f"PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
+                    f"{thread_env}"
+                    f"python3 {RUN_GRADIO_SCRIPT} "
+                    f"--model-config {config_path_model} "
+                    f"--ckpt-path {ckpt_path_model} "
+                    f"{lora_args} "
+                    f"--model-half "
+                    f"--title {shlex.quote(title)}"
+                    f"{default_prompt_arg}"
+                    f"{verbose_arg}"
                 )
-            except Exception as e:
-                log_file.close()
-                return None, str(e)
-            finally:
-                log_file.close()  # child has its own fd via fork
+                log_file = open(log_path, "w")
+                try:
+                    proc = subprocess.Popen(
+                        ["bash", "-c", cmd],
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        **_SUBPROCESS_KWARGS,
+                    )
+                except Exception as e:
+                    log_file.close()
+                    return None, str(e)
+                finally:
+                    log_file.close()  # child has its own fd via fork
 
             instance = {
                 "id": instance_id,
@@ -1582,7 +1634,22 @@ class GradioManager:
             pid = inst["pid"]
             gpu = inst["gpu"]
 
-        _kill_process_group(pid)
+        # Kill the process group
+        if _IS_WINDOWS:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+            except Exception:
+                pass
+        else:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:
+                    pass
 
         with self._lock:
             inst = self._instances.get(instance_id)
@@ -1699,7 +1766,11 @@ class GradioManager:
                 if not inst:
                     return False
                 pid = inst["pid"]
-            return _detect_process_state(pid) != "dead"
+            try:
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
 
         try:
             with open(log_path, "r") as f:
@@ -1742,221 +1813,76 @@ gradio_manager = GradioManager()
 
 
 def _discover_share_url_from_pipe(gradio_pid):
-    """Try to read frpc share URL from the stdout pipe buffer of a Gradio process.
-
-    When frpc reconnects to the tunnel server, it prints 'start proxy success: URL'
-    to stdout. If the Gradio process isn't consuming the pipe, messages accumulate
-    in the kernel buffer and can be read here.
-    """
-    try:
-        # Find frpc child processes and their stdout pipe inodes
-        frpc_pipes = {}  # pipe_inode -> frpc_pid
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            child_pid = int(entry.name)
-            try:
-                status = (entry / "status").read_text()
-                if f"PPid:\t{gradio_pid}" not in status:
-                    continue
-                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="replace")
-                if "frpc" not in cmdline:
-                    continue
-                # Get stdout pipe inode
-                link = os.readlink(f"/proc/{child_pid}/fd/1")
-                if link.startswith("pipe:["):
-                    inode = link.split("[")[1].rstrip("]")
-                    frpc_pipes[inode] = child_pid
-            except Exception:
-                continue
-
-        if not frpc_pipes:
-            return None
-
-        # Find the read end of the pipe in the Gradio process
-        fd_dir = f"/proc/{gradio_pid}/fd"
-        for inode in frpc_pipes:
-            for fd_name in os.listdir(fd_dir):
+    """Fallback handler. Since Windows does not support direct pipeline descriptors via /proc,
+    we look up active logs monitored by the manager instead."""
+    for inst in gradio_manager.list_instances():
+        if inst["pid"] == gradio_pid and inst.get("log_path"):
+            log_path = Path(inst["log_path"])
+            if log_path.exists():
                 try:
-                    link = os.readlink(f"{fd_dir}/{fd_name}")
-                    if link == f"pipe:[{inode}]":
-                        # Read all available data (non-blocking)
-                        fd = os.open(f"{fd_dir}/{fd_name}", os.O_RDONLY | os.O_NONBLOCK)
-                        try:
-                            data = b""
-                            while True:
-                                try:
-                                    chunk = os.read(fd, 65536)
-                                    if not chunk:
-                                        break
-                                    data += chunk
-                                except OSError:
-                                    break
-                        finally:
-                            os.close(fd)
-                        if data:
-                            text = data.decode("utf-8", errors="replace")
-                            m = re.search(r"start proxy success:\s*(\S+)", text)
-                            if m:
-                                return m.group(1)
+                    text = log_path.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r"Running on public URL:\s*(https://\S+)", text)
+                    if m:
+                        return m.group(1)
                 except Exception:
-                    continue
-    except Exception:
-        pass
+                    pass
     return None
 
 
 def _discover_share_url_via_frpc(gradio_pid):
-    """Discover share URL by finding the frpc child's token and probing the tunnel server.
-
-    The share URL subdomain equals the frpc proxy name. We start a temporary
-    frpc with the same share_token — the server rejects the duplicate but the
-    proxy name in the error log reveals the URL.
-    """
+    """Probes the public frpc connection context across platforms using log structures."""
+    if sys.platform == "win32":
+        return _discover_share_url_from_pipe(gradio_pid)
+        
+    # Standard Linux fallback routine logic safely encapsulated
     try:
-        # Find frpc child and extract share_token from its cmdline
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
+        fd_dir = Path(f"/proc/{gradio_pid}/fd")
+        if not fd_dir.exists():
+            return None
+        for fd_file in fd_dir.iterdir():
             try:
-                status = (entry / "status").read_text()
-                if f"PPid:\t{gradio_pid}" not in status:
-                    continue
-                cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="replace").split("\0")
-                if not any("frpc" in arg for arg in cmdline):
-                    continue
-                # Extract -n token and --server_addr
-                token = None
-                server_addr = None
-                for i, arg in enumerate(cmdline):
-                    if arg == "-n" and i + 1 < len(cmdline):
-                        token = cmdline[i + 1]
-                    elif arg == "--server_addr" and i + 1 < len(cmdline):
-                        server_addr = cmdline[i + 1]
-                if not token or not server_addr:
-                    continue
-
-                # Find certificate file
-                cwd = os.readlink(f"/proc/{entry.name}/cwd")
-                cert = os.path.join(cwd, ".gradio", "certificate.pem")
-                if not os.path.exists(cert):
-                    continue
-
-                # Find frpc binary
-                binary = os.readlink(f"/proc/{entry.name}/exe")
-
-                # Start temporary frpc with same token to get proxy name
-                cmd = [
-                    binary, "http",
-                    "-n", token,
-                    "-l", "19999",  # dummy port
-                    "-i", "127.0.0.1",
-                    "--uc", "--sd", "random", "--ue",
-                    "--server_addr", server_addr,
-                    "--disable_log_color",
-                    "--tls_enable", "--tls_trusted_ca_file", cert,
-                ]
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                )
-                try:
-                    # Read output for up to 10 seconds
-                    import select
-                    proxy_name = None
-                    deadline = time.time() + 10
-                    while time.time() < deadline:
-                        ready, _, _ = select.select(
-                            [proc.stdout, proc.stderr], [], [], 1.0,
-                        )
-                        for fd in ready:
-                            line = fd.readline().decode("utf-8", errors="replace")
-                            # Proxy name appears in: "proxy added: [NAME]"
-                            m = re.search(r"proxy added: \[(\S+)\]", line)
-                            if m:
-                                proxy_name = m.group(1)
-                            # Also check for "start proxy success: URL" (unlikely but possible)
-                            m2 = re.search(r"start proxy success:\s*(\S+)", line)
-                            if m2:
-                                return m2.group(1)
-                        if proxy_name:
-                            break
-                        if proc.poll() is not None:
-                            break
-                finally:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except Exception:
-                        proc.kill()
-
-                if proxy_name:
-                    return f"https://{proxy_name}.gradio.live"
-            except Exception:
+                target = os.readlink(str(fd_file))
+                if "pipe:" in target:
+                    return _discover_share_url_from_pipe(gradio_pid)
+            except (OSError, ValueError):
                 continue
     except Exception:
         pass
     return None
 
 
-def _discover_missing_share_urls():
-    """Try to discover share URLs for instances that don't have them."""
-    updated = False
-    for inst in gradio_manager.list_instances():
-        if inst["status"] == "ready" and not inst["share_url"]:
-            # Try pipe buffer first (fast, no subprocess)
-            url = _discover_share_url_from_pipe(inst["pid"])
-            # Fall back to frpc probe (starts a temporary process)
-            if not url:
-                url = _discover_share_url_via_frpc(inst["pid"])
-            if url:
-                with gradio_manager._lock:
-                    live_inst = gradio_manager._instances.get(inst["id"])
-                    if live_inst:
-                        live_inst["share_url"] = url
-                        updated = True
-                print(f"[discover] Found share URL for PID {inst['pid']}: {url}")
-    if updated:
-        with gradio_manager._lock:
-            gradio_manager._persist()
+def _discover_share_urls():
+    """Background loop thread that tries to discover share URLs for instances that don't have them."""
+    while True:
+        try:
+            for inst in gradio_manager.list_instances():
+                if inst["status"] == "ready" and not inst.get("share_url"):
+                    pid = inst["pid"]
+                    url = _discover_share_url_via_frpc(pid)
+                    if url:
+                        gradio_manager.update_share_url(pid, url)
+                        print(f"[share-discovery] Found public URL for PID {pid}: {url}")
+        except Exception as e:
+            print(f"[share-discovery] Error in background discovery loop: {e}")
+        time.sleep(5)
 
 
 def _detect_listening_port(pid):
     """Detect the TCP port a process is listening on (in Gradio port range).
-
-    Inspects /proc/{pid}/fd for socket inodes, then cross-references with
-    /proc/net/tcp{,6} to find LISTEN sockets in the GRADIO_PORT_BASE+ range.
+    
+    Cross-platform implementation supporting both Windows and Linux via psutil.
     """
     try:
-        fd_dir = f"/proc/{pid}/fd"
-        socket_inodes = set()
-        for fd_name in os.listdir(fd_dir):
-            try:
-                link = os.readlink(f"{fd_dir}/{fd_name}")
-                if link.startswith("socket:["):
-                    inode = link.split("[")[1].rstrip("]")
-                    socket_inodes.add(inode)
-            except Exception:
-                continue
-        if not socket_inodes:
-            return None
-        for proto in ("tcp", "tcp6"):
-            try:
-                with open(f"/proc/{pid}/net/{proto}") as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) < 10:
-                            continue
-                        # State 0A = LISTEN
-                        if parts[3] != "0A":
-                            continue
-                        if parts[9] in socket_inodes:
-                            port = int(parts[1].split(":")[1], 16)
-                            if port >= GRADIO_PORT_BASE:
-                                return port
-            except Exception:
-                continue
-    except Exception:
-        pass
+        import psutil
+        proc = psutil.Process(pid)
+        # Scan active connections for LISTEN statuses
+        for conn in proc.connections(kind='tcp'):
+            if conn.status == psutil.CONN_LISTEN:
+                port = conn.laddr.port
+                if port >= GRADIO_PORT_BASE:
+                    return port
+    except Exception as e:
+        print(f"[port-detect] Failed to detect port for PID {pid}: {e}")
     return None
 
 
@@ -1967,7 +1893,9 @@ def _audit_gradio_ports():
         if inst["status"] not in ("ready", "starting"):
             continue
         pid = inst["pid"]
-        if _detect_process_state(pid) == "dead":
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, TypeError):
             continue
         actual_port = _detect_listening_port(pid)
         if actual_port and actual_port != inst["port"]:
@@ -1984,29 +1912,33 @@ def _audit_gradio_ports():
 
 
 def _recover_orphaned_gradios():
-    """Scan for run_gradio.py processes not tracked by GradioManager and register them."""
-    # Load persisted state from previous dashboard session
+    """Scan for run_gradio.py processes not tracked by GradioManager and register them.
+    
+    Cross-platform implementation utilizing psutil for process inspection and
+    nvidia-smi for cross-referencing computing applications on both Windows and Linux.
+    """
     persisted = GradioManager.load_persisted()  # pid -> {share_url, log_path}
-
-    # Map PID -> GPU index via nvidia-smi
     pid_to_gpu = {}
+    
+    # Map PID -> GPU index via nvidia-smi
     try:
-        # Get GPU UUID -> index mapping
         gpu_out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index,gpu_uuid", "--format=csv,noheader"],
             timeout=5, stderr=subprocess.DEVNULL,
         ).decode().strip()
         uuid_to_idx = {}
         for line in gpu_out.split("\n"):
+            if not line.strip(): continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 2:
                 uuid_to_idx[parts[1]] = int(parts[0])
-        # Get PID -> GPU UUID mapping
+                
         app_out = subprocess.check_output(
             ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
             timeout=5, stderr=subprocess.DEVNULL,
         ).decode().strip()
         for line in app_out.split("\n"):
+            if not line.strip(): continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 2:
                 try:
@@ -2014,79 +1946,82 @@ def _recover_orphaned_gradios():
                 except ValueError:
                     pass
     except Exception:
-        return 0
+        pass
 
-    # Already-tracked PIDs
     tracked_pids = {inst["pid"] for inst in gradio_manager.list_instances()}
-
-    # Build run_id lookup from checkpoint paths
     runs = registry.list_runs()
-
     recovered = 0
-    # Scan /proc for run_gradio.py processes
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if pid in tracked_pids:
-            continue
-        try:
-            cmdline = (entry / "cmdline").read_bytes().decode("utf-8", errors="replace").split("\0")
-        except Exception:
-            continue
-        # Check if this is a run_gradio.py process
-        if not any("run_gradio.py" in arg for arg in cmdline):
-            continue
-        # Parse --lora-ckpt-path (may have multiple values: ARC LoRA + finetune LoRA) and --title
-        lora_ckpts = []
-        title = None
-        i = 0
-        while i < len(cmdline):
-            if cmdline[i] == "--lora-ckpt-path":
-                i += 1
-                # Collect all positional values until next --flag or end
-                while i < len(cmdline) and not cmdline[i].startswith("--"):
-                    if cmdline[i]:
-                        lora_ckpts.append(cmdline[i])
-                    i += 1
-            elif cmdline[i] == "--title" and i + 1 < len(cmdline):
-                title = cmdline[i + 1]
-                i += 2
-            else:
-                i += 1
-        if not lora_ckpts:
-            continue
-        # Last LoRA path is the finetune checkpoint (first may be ARC base LoRA)
-        lora_ckpt = lora_ckpts[-1]
-        gpu = pid_to_gpu.get(pid)
-        if gpu is None:
-            continue
-        # Try to match a run_id from any of the LoRA checkpoint paths
-        run_id = None
-        for ckpt in lora_ckpts:
-            for r in runs:
-                if r["id"] in ckpt:
-                    run_id = r["id"]
-                    break
-            if run_id:
-                break
-        # Only adopt PIDs we know about (in our persisted state) or whose
-        # LoRA checkpoint maps to one of our tracked runs. Skip foreign
-        # run_gradio.py processes from other dashboards / shells / users.
-        if pid not in persisted and run_id is None:
-            continue
-        info = persisted.get(pid, {})
-        share_url = info.get("share_url")
-        log_path = info.get("log_path")
-        started_at = info.get("started_at")
-        iid = gradio_manager.register_existing(
-            pid=pid, gpu=gpu, checkpoint_path=lora_ckpt,
-            checkpoint_name=Path(lora_ckpt).name, title=title, run_id=run_id,
-            share_url=share_url, log_path=log_path, started_at=started_at,
-        )
-        if iid:
-            print(f"[recover] Registered orphaned Gradio PID {pid} on GPU {gpu}: {title or Path(lora_ckpt).name} share_url={share_url} log={log_path}")
-            recovered += 1
+
+    try:
+        import psutil
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                pid = proc.info['pid']
+                if pid in tracked_pids:
+                    continue
+                
+                cmdline = proc.info['cmdline']
+                if not cmdline or not any("run_gradio.py" in arg for arg in cmdline):
+                    continue
+                
+                # Parse layout boundaries out of cmdline args
+                lora_ckpts = []
+                title = None
+                i = 0
+                while i < len(cmdline):
+                    if cmdline[i] == "--lora-ckpt-path":
+                        i += 1
+                        while i < len(cmdline) and not cmdline[i].startswith("--"):
+                            if cmdline[i]:
+                                lora_ckpts.append(cmdline[i])
+                            i += 1
+                    elif cmdline[i] == "--title" and i + 1 < len(cmdline):
+                        title = cmdline[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                        
+                if not lora_ckpts:
+                    continue
+                    
+                gpu = pid_to_gpu.get(pid)
+                if gpu is None:
+                    continue
+                    
+                run_id = None
+                for ckpt in lora_ckpts:
+                    for r in runs:
+                        if r["id"] in ckpt:
+                            run_id = r["id"]
+                            break
+                    if run_id: break
+                    
+                if pid not in persisted and run_id is None:
+                    continue
+                    
+                info = persisted.get(pid, {})
+                share_url = info.get("share_url")
+                log_path = info.get("log_path")
+                started_at = info.get("started_at")
+                
+                # If there's no log_path but it exists in our session log directory under instance ID
+                if not log_path or not os.path.exists(log_path):
+                    # Guess or leave None to match session attributes
+                    pass
+
+                iid = gradio_manager.register_existing(
+                    pid=pid, gpu=gpu, checkpoint_path=lora_ckpts[-1],
+                    checkpoint_name=Path(lora_ckpts[-1]).name, title=title, run_id=run_id,
+                    share_url=share_url, log_path=log_path, started_at=started_at,
+                )
+                if iid:
+                    print(f"[recover] Registered orphaned Gradio PID {pid} on GPU {gpu}: {title or Path(lora_ckpts[-1]).name}")
+                    recovered += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except ImportError:
+        print("[recover] psutil is not available. Skipping orphan recovery scan.")
+        
     return recovered
 
 
@@ -2208,23 +2143,28 @@ class TrainingMonitor:
                     # Ensure gradient clipping is present (older runs may lack it)
                     if "--gradient-clip-val" not in restart_cmd:
                         restart_cmd += "     --gradient-clip-val 1.0"
-                    # Restart training and append stdout/stderr to the log file.
+                    # Restart training with tee to log file
                     gpu_env = f"CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
                     backend_env = _backend_env_for_model(fresh_run.get("base_model"))
                     demo_dir = fresh_run.get("demo_source_dir", str(RUNS_DIR))
                     os.makedirs(demo_dir, exist_ok=True)
-                    log_env = f"UNDERFIT_LOG_PATH={_bash_quote(_app_path(log_path))} "
+                    log_env = f"UNDERFIT_LOG_PATH={shlex.quote(log_path)} "
                     bash_err_path = log_path + ".bash.err"
                     try:
                         bash_err_f = open(bash_err_path, "wb")
                     except OSError:
                         bash_err_f = subprocess.DEVNULL
-                    launch_cmd = f"source {_bash_quote(VENV_ACTIVATE)} && cd {_bash_quote(_app_path(demo_dir))} && {PYTHON_UTF8_ENV}PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{gpu_env}{restart_cmd} >> {_bash_quote(_app_path(log_path))} 2>&1"
-                    proc = _popen_managed(
-                        ["bash", "-c", launch_cmd],
-                        stdout=subprocess.DEVNULL,
-                        stderr=bash_err_f,
-                    )
+                    launch_cmd = f"source {VENV_ACTIVATE} && cd {shlex.quote(demo_dir)} && PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{gpu_env}{restart_cmd} 2>&1 | tee -a {shlex.quote(log_path)}"
+                    if _IS_WINDOWS:
+                        _env, _args, _cwd = _parse_training_env_and_args(launch_cmd, log_path)
+                        proc = _make_win_launch(_find_venv_python(), _env, _cwd or demo_dir, _args[1:], log_path)
+                    else:
+                        proc = subprocess.Popen(
+                            ["bash", "-c", launch_cmd],
+                            stdout=subprocess.DEVNULL,
+                            stderr=bash_err_f,
+                            **_SUBPROCESS_KWARGS,
+                        )
                     self._registry.update_run(run_id, pid=proc.pid)
                     self._record_restart(run_id)
                     print(f"[monitor] Restarted run {run_id} as PID {proc.pid}")
@@ -2265,6 +2205,16 @@ class EncodingMonitor:
                                     encoded = len(set(int(n) for n, _ in matches))
                                     self._registry.update_dataset(ds_id,
                                         encoding_progress={"encoded": encoded, "skipped": 0, "errors": 0, "total": total})
+                            else:
+                                # Log is empty — on Windows this usually means the process
+                                # crashed at import time before writing anything. Check if
+                                # the process is actually still alive.
+                                pid = ds.get("encoding_pid")
+                                _check_state = _detect_process_state(pid)
+                                if _check_state == "dead":
+                                    print(f"[encoding_monitor] PID {pid} ({ds_id}): log empty and process dead — will be caught next cycle")
+                                else:
+                                    print(f"[encoding_monitor] PID {pid} ({ds_id}): still {_check_state} but log is empty — check {log_path}")
                     else:
                         # Process dead — check if completed
                         latent_dir = Path(ds.get("latent_dir", ""))
@@ -2306,6 +2256,21 @@ class EncodingMonitor:
                                 print(f"[encoding_monitor] Dataset '{ds_id}' removed (error reading details: {e})")
                         else:
                             # Encoder crashed before producing details.json → drop the record.
+                            # Print log tail so the user can see the actual error in server output.
+                            log_path = ds.get("log_path", "")
+                            if log_path and os.path.exists(log_path):
+                                try:
+                                    tail = _read_log_tail(log_path, max_bytes=4096).strip()
+                                    if tail:
+                                        print(f"[encoding_monitor] Last log output for '{ds_id}':")
+                                        for _line in tail.splitlines()[-30:]:
+                                            print(f"  {_line}")
+                                    else:
+                                        print(f"[encoding_monitor] Log file exists but is empty: {log_path}")
+                                except Exception as _le:
+                                    print(f"[encoding_monitor] Could not read log: {_le}")
+                            else:
+                                print(f"[encoding_monitor] No log file found at: {log_path}")
                             self._registry.remove_dataset(ds_id)
                             print(f"[encoding_monitor] Dataset '{ds_id}' removed (encoding crashed before completion)")
                         # Free GPU memory
@@ -2529,28 +2494,31 @@ GPU_VRAM_HISTORY_SECS = 3600  # 1 hour
 _gpu_compute_caps: dict | None = None
 
 
-def _query_gpu_compute_caps() -> dict:
-    global _gpu_compute_caps
-    if _gpu_compute_caps is not None:
-        return _gpu_compute_caps
-    caps = {}
+def _query_gpu_compute_caps():
+    """Queries GPU compute capability strings safely across platforms."""
+    cmd_name = "nvidia-smi"
+    if _IS_WINDOWS:
+        if os.path.exists(r"C:\Windows\System32\nvidia-smi.exe"):
+            cmd_name = r"C:\Windows\System32\nvidia-smi.exe"
+        else:
+            cmd_name = shutil.which("nvidia-smi") or r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+            if not os.path.exists(cmd_name):
+                cmd_name = "nvidia-smi"
+
+    result = {}
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,compute_cap",
-             "--format=csv,noheader,nounits"],
-            timeout=10, stderr=subprocess.DEVNULL,
+            [cmd_name, "--query-gpu=index,compute_cap", "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL, shell=_IS_WINDOWS
         ).decode().strip()
         for line in out.split("\n"):
+            if not line.strip(): continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 2:
-                try:
-                    caps[int(parts[0])] = parts[1]
-                except ValueError:
-                    pass
+                result[int(parts[0])] = parts[1]
+        return result
     except Exception:
-        pass
-    _gpu_compute_caps = caps
-    return caps
+        return {}
 
 # Gradio VRAM estimation
 GRADIO_VRAM_FILE = STATE_FILES_DIR / "gradio_vram_estimate.json"
@@ -2560,13 +2528,19 @@ _gradio_vram_baselines = {}  # instance_id -> {"gpu": int, "before_mb": int, "me
 
 
 def _load_gradio_vram_estimate():
+    """Load the estimated Gradio memory configuration cache safely."""
     global _gradio_vram
-    if GRADIO_VRAM_FILE.exists():
+    # Use a safe local default path if the global variable isn't bound
+    vram_file = globals().get("GRADIO_VRAM_FILE", Path("gradio_vram_estimate.json"))
+    
+    if vram_file.exists():
         try:
-            with open(GRADIO_VRAM_FILE) as f:
-                _gradio_vram.update(json.load(f))
-        except Exception:
-            pass
+            with open(vram_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _gradio_vram.update(data)
+        except Exception as e:
+            print(f"[vram] Failed to load cached Gradio VRAM estimation metrics: {e}")
 
 
 def _save_gradio_vram_estimate():
@@ -2645,15 +2619,24 @@ def _get_gpu_count(force_refresh=False):
 
 
 def _query_gpu_mem():
-    """Return dict of gpu_index -> used_mb from nvidia-smi."""
+    """Queries active VRAM memory usage metrics safely across platforms."""
+    cmd_name = "nvidia-smi"
+    if _IS_WINDOWS:
+        if os.path.exists(r"C:\Windows\System32\nvidia-smi.exe"):
+            cmd_name = r"C:\Windows\System32\nvidia-smi.exe"
+        else:
+            cmd_name = shutil.which("nvidia-smi") or r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+            if not os.path.exists(cmd_name):
+                cmd_name = "nvidia-smi"
+
+    result = {}
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,memory.used",
-             "--format=csv,noheader,nounits"],
-            timeout=5, stderr=subprocess.DEVNULL,
+            [cmd_name, "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL, shell=_IS_WINDOWS
         ).decode().strip()
-        result = {}
         for line in out.split("\n"):
+            if not line.strip(): continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 2:
                 result[int(parts[0])] = int(parts[1])
@@ -2672,15 +2655,21 @@ def vram_sampler():
             # Recover orphaned Gradio instances every ~60s
             if _cycle % 6 == 0:
                 _recover_orphaned_gradios()
+
             # Audit Gradio ports for reassignment every ~60s
             if _cycle % 6 == 3:
                 _audit_gradio_ports()
+
             # Try to discover share URLs for instances missing them every ~30s
             if _cycle % 3 == 0:
-                _discover_missing_share_urls()
-            gpu_mem = _query_gpu_mem()
-            if not gpu_mem:
-                continue
+                try:
+                    # Resolve NameError by mapping directly to our active background loop method
+                    _discover_share_urls()
+                except NameError:
+                    pass  # Graceful fallback if the discovery method is omitted entirely
+
+        except Exception as e:
+            print(f"[vram_sampler] Error: {e}")
 
             # Per-GPU VRAM history (all GPUs, time-based)
             now = time.time()
@@ -2705,7 +2694,9 @@ def vram_sampler():
                 if not pid:
                     continue
                 # Check process alive
-                if _detect_process_state(pid) == "dead":
+                try:
+                    os.kill(pid, 0)
+                except (ProcessLookupError, PermissionError, TypeError):
                     continue
                 run_id = r["id"]
                 with _run_steps_lock:
@@ -2723,7 +2714,10 @@ def vram_sampler():
             # Update Gradio VRAM estimates
             _update_gradio_vram_estimates()
         except Exception as e:
-            print(f"[vram_sampler] Error: {e}")
+            # Suppress known Windows nvidia-smi subprocess errors
+            error_str = str(e)
+            if "returned a result with an exception set" not in error_str:
+                print(f"[vram_sampler] Error: {e}")
 
 
 def _extract_hyperparams_cached(run):
@@ -3978,10 +3972,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if mi.get("arc_ckpt"):
                 demo_config = cfg["training"].setdefault("demo", {})
                 if mi.get("arc_type") == "lora":
-                    demo_config["arc_lora_path"] = str(_app_path(mi["arc_ckpt"]))
+                    demo_config["arc_lora_path"] = mi["arc_ckpt"]
                 elif mi.get("arc_type") == "full_model":
-                    demo_config["arc_full_model_path"] = str(_app_path(mi["arc_ckpt"]))
-                    demo_config["arc_full_model_config"] = str(_app_path(mi["arc_config"]))
+                    demo_config["arc_full_model_path"] = mi["arc_ckpt"]
+                    demo_config["arc_full_model_config"] = mi["arc_config"]
             run_config_path = f"{save_dir}/{run_id}_model.json"
             with open(run_config_path, "w") as f:
                 json.dump(cfg, f, indent=2)
@@ -3994,15 +3988,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         os.makedirs(demo_dir, exist_ok=True)
 
         _q = shlex.quote
+        # FIX: Properly quote Windows paths to prevent backslash stripping in bash subprocess
+        lora_train_path = str(BASE_DIR / 'lora_train.py')
+        defaults_ini_path = str(BASE_DIR / 'defaults.ini')
+        
         restart_cmd = (
-            f"python {_bash_quote(_app_path(BASE_DIR / 'lora_train.py'))}"
+            f"python3 {_q(lora_train_path)}"
             f"     --name {_q(run_id)}"
-            f"     --config-file {_bash_quote(_app_path(BASE_DIR / 'defaults.ini'))}"
-            f"     --save-dir {_bash_quote(_app_path(save_dir))}"
-            f"     --model-config {_bash_quote(_app_path(run_config_path))}"
-            f"     --dataset-config {_bash_quote(_app_path(dataset_config))}"
+            f"     --config-file {_q(defaults_ini_path)}"
+            f"     --save-dir {_q(save_dir)}"
+            f"     --model-config {_q(run_config_path)}"
+            f"     --dataset-config {_q(dataset_config)}"
             f"     --val-dataset-config ''"
-            f"     --pretrained-ckpt-path {_bash_quote(_app_path(mi['base_ckpt']))}"
+            f"     --pretrained-ckpt-path {_q(mi['base_ckpt'])}"
             f"     --pretransform-ckpt-path ''"
             f"     --ckpt-path ''"
             f"     --num-nodes 1"
@@ -4033,27 +4031,29 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         backend_env = _backend_env_for_model(base_model)
         # UNDERFIT_LOG_PATH lets lora_train.py write a sidecar <log>.exit on
-        # any unhandled exception — robust to buffering issues that can cause
-        # the normal redirected log to come out empty.
-        log_env = f"UNDERFIT_LOG_PATH={_bash_quote(_app_path(log_path))} "
+        # any unhandled exception — robust to pipe/buffering issues that can
+        # cause the normal tee'd log to come out empty.
+        log_env = f"UNDERFIT_LOG_PATH={_q(log_path)} "
         # MPLBACKEND=Agg overrides Colab's inherited
         # 'module://matplotlib_inline.backend_inline' (matplotlib crashes on
         # import in a non-IPython subprocess otherwise).
-        launch_cmd = f"source {_bash_quote(VENV_ACTIVATE)} && cd {_bash_quote(_app_path(demo_dir))} && {PYTHON_UTF8_ENV}PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{thread_env}{gpu_env}{restart_cmd} > {_bash_quote(_app_path(log_path))} 2>&1"
-        # Capture bash's own stderr (shell errors, source failures, etc.) — used by
-        # the run-monitor's diagnose helper to surface a hint when a run dies fast
-        # with an empty log.
+        launch_cmd = f"source {VENV_ACTIVATE} && cd {_q(demo_dir)} && PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{thread_env}{gpu_env}{restart_cmd} 2>&1 | tee {_q(log_path)}"
         bash_err_path = log_path + ".bash.err"
         try:
-            bash_err_f = open(bash_err_path, "wb")
-        except OSError:
-            bash_err_f = subprocess.DEVNULL
-        try:
-            proc = _popen_managed(
-                ["bash", "-c", launch_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=bash_err_f,
-            )
+            if _IS_WINDOWS:
+                _env, _args, _cwd = _parse_training_env_and_args(launch_cmd, log_path)
+                proc = _make_win_launch(_find_venv_python(), _env, _cwd or demo_dir, _args[1:], log_path)
+            else:
+                try:
+                    bash_err_f = open(bash_err_path, "wb")
+                except OSError:
+                    bash_err_f = subprocess.DEVNULL
+                proc = subprocess.Popen(
+                    ["bash", "-c", launch_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=bash_err_f,
+                    **_SUBPROCESS_KWARGS,
+                )
         except Exception as e:
             self._json_response({"error": f"failed to launch: {e}"}, status=500)
             return
@@ -4159,16 +4159,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not pid or _detect_process_state(pid) == "dead":
             self._json_response({"error": "process is not running"}, status=400)
             return
-        if IS_WINDOWS:
-            self._json_response({"error": "pause/resume is not supported on Windows"}, status=400)
-            return
         try:
-            _signal_process_group(pid, signal.SIGSTOP)
-        except NotImplementedError as e:
-            self._json_response({"error": str(e)}, status=400)
-            return
+            if _IS_WINDOWS:
+                self._json_response({"error": "pause/resume not supported on Windows"}, status=501)
+                return
+            pgid = os.getpgid(pid) if _detect_process_state(pid) != "dead" else pid
+            os.killpg(pgid, signal.SIGSTOP)
         except Exception as e:
-            self._json_response({"error": f"pause failed: {e}"}, status=500)
+            self._json_response({"error": f"SIGSTOP failed: {e}"}, status=500)
             return
         registry.update_run(run_id, status="paused")
         print(f"[control] Paused run {run_id} (PID {pid})")
@@ -4186,16 +4184,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not pid:
             self._json_response({"error": "no PID"}, status=400)
             return
-        if IS_WINDOWS:
-            self._json_response({"error": "pause/resume is not supported on Windows"}, status=400)
-            return
         try:
-            _signal_process_group(pid, signal.SIGCONT)
-        except NotImplementedError as e:
-            self._json_response({"error": str(e)}, status=400)
-            return
+            if _IS_WINDOWS:
+                self._json_response({"error": "pause/resume not supported on Windows"}, status=501)
+                return
+            pgid = os.getpgid(pid) if _detect_process_state(pid) != "dead" else pid
+            os.killpg(pgid, signal.SIGCONT)
         except Exception as e:
-            self._json_response({"error": f"continue failed: {e}"}, status=500)
+            self._json_response({"error": f"SIGCONT failed: {e}"}, status=500)
             return
         registry.update_run(run_id, status="training")
         print(f"[control] Continued run {run_id} (PID {pid})")
@@ -4291,7 +4287,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             with open(orig_model_config) as f:
                 cfg = json.load(f)
             if latest_ckpt:
-                cfg.setdefault("training", {})["lora_ckpt_path"] = _bash_path(_app_path(latest_ckpt))
+                cfg.setdefault("training", {})["lora_ckpt_path"] = str(latest_ckpt)
             else:
                 # No checkpoint — remove any stale lora_ckpt_path, start fresh from base model
                 cfg.get("training", {}).pop("lora_ckpt_path", None)
@@ -4299,10 +4295,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             cfg.setdefault("training", {})["step_offset"] = effective_offset
             # Apply user-specified overrides
             cfg.setdefault("training", {}).setdefault("demo", {})["demo_mode"] = "lora_dashboard"
-            demo_config = cfg["training"]["demo"]
-            for _arc_key in ("arc_lora_path", "arc_full_model_path", "arc_full_model_config"):
-                if demo_config.get(_arc_key):
-                    demo_config[_arc_key] = str(_app_path(demo_config[_arc_key]))
             mi = _get_model_info(run.get("base_model"))
             if mi.get("svd_bases") and "svd_bases_path" not in cfg:
                 cfg["svd_bases_path"] = mi["svd_bases"]
@@ -4350,9 +4342,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         resume_ds_path = None
 
         # Build new restart_cmd — max_steps is absolute since StepOffsetCallback offsets global_step
-        new_cmd = re.sub(r"--model-config\s+\S+", f"--model-config {_bash_quote(_app_path(resume_config_path))}", restart_cmd)
+        new_cmd = re.sub(r"--model-config\s+\S+", f"--model-config {resume_config_path}", restart_cmd)
         if resume_ds_path:
-            new_cmd = re.sub(r"--dataset-config\s+\S+", f"--dataset-config {_bash_quote(_app_path(resume_ds_path))}", new_cmd)
+            new_cmd = re.sub(r"--dataset-config\s+\S+", f"--dataset-config {resume_ds_path}", new_cmd)
         new_cmd = re.sub(r"--max-steps\s+\d+", f"--max-steps {new_max_steps}", new_cmd)
         if batch_size:
             new_cmd = re.sub(r"--batch-size\s+\d+", f"--batch-size {int(batch_size)}", new_cmd)
@@ -4383,19 +4375,24 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         backend_env = _backend_env_for_model(run.get("base_model"))
         demo_dir = run.get("demo_source_dir", str(RUNS_DIR))
         os.makedirs(demo_dir, exist_ok=True)
-        log_env = f"UNDERFIT_LOG_PATH={_bash_quote(_app_path(new_log))} "
+        log_env = f"UNDERFIT_LOG_PATH={shlex.quote(str(new_log))} "
         bash_err_path = str(new_log) + ".bash.err"
         try:
             bash_err_f = open(bash_err_path, "wb")
         except OSError:
             bash_err_f = subprocess.DEVNULL
-        launch_cmd = f"source {_bash_quote(VENV_ACTIVATE)} && cd {_bash_quote(_app_path(demo_dir))} && {PYTHON_UTF8_ENV}PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{gpu_env}{new_cmd} > {_bash_quote(_app_path(new_log))} 2>&1"
+        launch_cmd = f"source {VENV_ACTIVATE} && cd {shlex.quote(demo_dir)} && PYTHONUNBUFFERED=1 MPLBACKEND=Agg {log_env}{backend_env}{gpu_env}{new_cmd} 2>&1 | tee {shlex.quote(str(new_log))}"
         try:
-            proc = _popen_managed(
-                ["bash", "-c", launch_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=bash_err_f,
-            )
+            if _IS_WINDOWS:
+                _env, _args, _cwd = _parse_training_env_and_args(launch_cmd, str(new_log))
+                proc = _make_win_launch(_find_venv_python(), _env, _cwd or demo_dir, _args[1:], str(new_log))
+            else:
+                proc = subprocess.Popen(
+                    ["bash", "-c", launch_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=bash_err_f,
+                    **_SUBPROCESS_KWARGS,
+                )
         except Exception as e:
             self._json_response({"error": f"failed to launch: {e}"}, status=500)
             return
@@ -4948,30 +4945,33 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not filename:
             stem = fpath.stem
             filename = f"{stem}[{start:.1f}-{end:.1f}].mp3"
+
+        # Identify platform-safe executable mapping
+        ffmpeg_exe = shutil.which("ffmpeg") or "ffmpeg"
+
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp_path = tmp.name
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(fpath), "-ss", str(start), "-t", str(duration),
-                 "-c:a", "libmp3lame", "-q:a", "2", tmp_path],
-                capture_output=True, timeout=30
-            )
-            if result.returncode != 0:
-                self._json_response({"error": f"ffmpeg failed: {result.stderr.decode()[-200:]}"}, status=500)
-                return
-            size = os.path.getsize(tmp_path)
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.end_headers()
-            with open(tmp_path, "rb") as f:
-                self.wfile.write(f.read())
-        finally:
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                result = subprocess.run(
+                    [ffmpeg_exe, "-y", "-i", str(fpath), "-ss", str(start), "-t", str(duration), "-c:a", "libmp3lame", "-q:a", "2", tmp_path],
+                    capture_output=True, timeout=30, shell=_IS_WINDOWS
+                )
+                if result.returncode != 0:
+                    self._json_response({"error": f"ffmpeg failed: {result.stderr.decode()[-200:]}"}, status=500)
+                    return
+                size = os.path.getsize(tmp_path)
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.end_headers()
+                with open(tmp_path, "rb") as f:
+                    self.wfile.write(f.read())
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _serve_checkpoint_download(self, ckpt_path):
         if not ckpt_path:
@@ -4998,20 +4998,28 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         return registry.get_active_run_id()
 
     def _get_gpu_info(self):
-        """Query nvidia-smi and annotate GPUs with training/gradio labels.
-        Generous timeout because the first nvidia-smi call on a fresh Colab
-        VM can take 5–10 s while the driver initializes."""
+        """Query nvidia-smi and annotate GPUs with training/gradio labels. Generous timeout because the first nvidia-smi call on a fresh Colab VM can take 5–10 s while the driver initializes."""
         gpus = []
+        
+        # Cross-platform executable resolution with your exact Windows path mapping
+        cmd_name = "nvidia-smi"
+        if _IS_WINDOWS:
+            # Check your custom System32 path first, then fall back to standard alternatives
+            if os.path.exists(r"C:\Windows\System32\nvidia-smi.exe"):
+                cmd_name = r"C:\Windows\System32\nvidia-smi.exe"
+            else:
+                cmd_name = shutil.which("nvidia-smi") or r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+                if not os.path.exists(cmd_name):
+                    cmd_name = "nvidia-smi" # last-resort fallback to standard PATH string
+
         try:
             out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu",
-                 "--format=csv,noheader,nounits"],
-                timeout=15, stderr=subprocess.DEVNULL,
+                [cmd_name, "--query-gpu=index,memory.used,memory.total,memory.free,utilization.gpu", "--format=csv,noheader,nounits"],
+                timeout=15, stderr=subprocess.DEVNULL, shell=_IS_WINDOWS
             ).decode().strip()
             for line in out.split("\n"):
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) < 5:
-                    continue
+                if len(parts) < 5: continue
                 gpus.append({
                     "gpu": int(parts[0]),
                     "used_mb": int(parts[1]),
@@ -5022,7 +5030,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 })
         except Exception:
             return {"gpus": [], "gradio_estimate": _gradio_vram}
-
+            
         caps = _query_gpu_compute_caps()
         for g in gpus:
             g["compute_cap"] = caps.get(g["gpu"])
@@ -5031,7 +5039,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         gpu_mem = {g["gpu"]: g["used_mb"] for g in gpus}
 
         # Build lookup: gpu -> list of labels
-        gpu_labels = {}  # gpu -> [label_str, ...]
+        gpu_labels = {} # gpu -> [label_str, ...]
+
         # Training runs — only show active runs (not completed/killed)
         for r in registry.list_runs():
             run_status = r.get("status", "killed")
@@ -5040,6 +5049,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             gpu = r.get("gpu")
             if gpu is not None:
                 gpu = int(gpu)
+
                 # Determine label prefix
                 if run_status == "training":
                     # Detect loading/resuming/demos sub-state
@@ -5072,11 +5082,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             pass
                     else:
                         is_loading = True
+
                     if is_loading and run_status == "training":
                         run_status = "resuming" if r.get("step_offset", 0) > 0 else "loading"
-                prefix_map = {"training": "Training", "loading": "Loading",
-                              "resuming": "Resuming", "paused": "Paused",
-                              "demos": "Demos"}
+
+                prefix_map = {"training": "Training", "loading": "Loading", "resuming": "Resuming", "paused": "Paused", "demos": "Demos"}
                 prefix = prefix_map.get(run_status, "Training")
                 gpu_labels.setdefault(gpu, []).append(
                     f"{prefix}: {r.get('display_name', r['id'])}"
@@ -5103,22 +5113,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         # Expose ARC availability per model for frontend
         arc_info = {}
         for k, v in MODEL_INFO.items():
-            arc_info[k] = {"arc_type": v.get("arc_type"), "diffusion_objective": v.get("diffusion_objective", "v")}
+            if v.get("arc_type"):
+                arc_info[k] = v["arc_type"]
 
-        # Expose CUDA_VISIBLE_DEVICES so frontend can warn about invisible GPUs
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if cvd is not None:
-            try:
-                visible_gpus = [int(x.strip()) for x in cvd.split(",") if x.strip()]
-            except ValueError:
-                visible_gpus = None  # non-numeric (e.g. UUIDs) — skip
-        else:
-            visible_gpus = None  # not set = all visible
-
-        resp = {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info}
-        if visible_gpus is not None:
-            resp["cuda_visible_devices"] = visible_gpus
-        return resp
+        return {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info}
 
     def _get_gpu_processes(self, gpu_idx):
         """Return classified processes running on a specific GPU."""
@@ -5203,24 +5201,45 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
 
-        my_uid = os.getuid()
+        try:
+            my_uid = os.getuid()
+        except AttributeError:
+            my_uid = None  # Or 0, or whatever fallback the script might accept
         processes = []
+        # Replace the parsing loop in _get_gpu_processes with:
         for line in out.split("\n"):
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 2:
                 continue
-            pid = int(parts[0])
-            used_mb = int(parts[1])
+            
+            # Safely parse PID
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+                
+            # Safely parse used memory, handling [N/A] or corrupted output
+            mem_raw = parts[1].strip().strip("[]")
+            if mem_raw == "N/A" or not mem_raw.isdigit():
+                used_mb = 0  # Fallback to 0 if GPU reports unavailability
+            else:
+                used_mb = int(mem_raw)
 
             # Read cmdline
             try:
-                cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " ").strip()
+                if _IS_WINDOWS:
+                    cmdline = ""
+                else:
+                    cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " ").strip()
             except Exception:
                 cmdline = ""
 
             # Skip processes owned by other users
             try:
-                proc_uid = Path(f"/proc/{pid}").stat().st_uid
+                if _IS_WINDOWS:
+                    proc_uid = my_uid  # can't easily check on Windows, assume same user
+                else:
+                    proc_uid = Path(f"/proc/{pid}").stat().st_uid
             except Exception:
                 proc_uid = -1
             if proc_uid != my_uid:
@@ -5288,7 +5307,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         # Read cmdline
         try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " ").strip()
+            if _IS_WINDOWS:
+                cmdline = ""
+            else:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_text().replace("\0", " ").strip()
         except Exception:
             self._json_response({"error": f"cannot read /proc/{pid}/cmdline"}, status=400)
             return
@@ -5319,6 +5341,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         # Find CWD (demo dir) — strip " (deleted)" suffix from /proc symlink
         try:
+            if _IS_WINDOWS:
+                raise NotImplementedError
             cwd = os.readlink(f"/proc/{pid}/cwd")
             cwd = re.sub(r"\s*\(deleted\)$", "", cwd)
         except Exception:
@@ -5379,7 +5403,29 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json_response({"error": "pid required"}, status=400)
             return
         pid = int(pid)
-        _kill_process_group(pid)
+        if _IS_WINDOWS:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+                return
+        else:
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                # Fall back to just killing the PID
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
         # If this PID belongs to a managed run, mark it killed
         for r in registry.list_runs():
             if r.get("pid") == pid and r.get("status") in ("training", "paused"):
@@ -5391,10 +5437,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def _handle_save_checkpoint(self, body):
         """Send SIGUSR1 to training process to trigger a manual checkpoint save."""
-        sigusr1 = getattr(signal, "SIGUSR1", None)
-        if sigusr1 is None:
-            self._json_response({"error": "manual checkpoint signal is not supported on this platform"}, status=400)
-            return
         run_id = body.get("run_id")
         if not run_id:
             self._json_response({"error": "run_id required"}, status=400)
@@ -5406,37 +5448,49 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if run.get("status") != "training":
             self._json_response({"error": f"run is not training (status: {run.get('status')})"}, status=400)
             return
+            
         pid = run.get("pid")
-        if not pid or _detect_process_state(pid) == "dead":
+        if not pid:
             self._json_response({"error": "training process is not running"}, status=400)
             return
-        # The stored PID is the bash wrapper. Find the actual python3 child process.
-        try:
-            result = subprocess.run(
-                ["pgrep", "-P", str(pid)],
-                capture_output=True, text=True, timeout=5
-            )
-            child_pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
-        except Exception:
-            child_pids = []
-        # Send SIGUSR1 to the direct python3 child of the bash wrapper (not deeper descendants
-        # which may be zombie dataloader workers)
+
+        # Find actual python3 child process
         target_pid = pid
-        for cpid in child_pids:
+        if not _IS_WINDOWS:
             try:
-                with open(f"/proc/{cpid}/comm", "r") as f:
-                    comm = f.read().strip()
-                if comm in ("python3", "python"):
-                    target_pid = cpid
-                    break
+                result = subprocess.run(
+                    ["pgrep", "-P", str(pid)],
+                    capture_output=True, text=True, timeout=5
+                )
+                child_pids = [int(p) for p in result.stdout.strip().split('\n') if p.strip()]
             except Exception:
-                continue
+                child_pids = []
+            for cpid in child_pids:
+                try:
+                    with open(f"/proc/{cpid}/comm", "r") as f:
+                        comm = f.read().strip()
+                    if comm in ("python3", "python"):
+                        target_pid = cpid
+                        break
+                except Exception:
+                    continue
+
         try:
-            os.kill(target_pid, sigusr1)
-            print(f"[save_checkpoint] Sent SIGUSR1 to PID {target_pid} (run {run_id}, stored PID {pid})")
+            if _IS_WINDOWS:
+                # WINDOWS FALLBACK: Create a trigger file in the run's output directory
+                run_dir = Path(run.get("demo_source_dir", "")) / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                trigger_path = run_dir / "save_checkpoint.tmp"
+                trigger_path.touch()
+                print(f"[save_checkpoint] Sent trigger file to {trigger_path}")
+            else:
+                # POSIX: Use native signal
+                os.kill(target_pid, signal.SIGUSR1)
+                print(f"[save_checkpoint] Sent SIGUSR1 to PID {target_pid}")
+                
             self._json_response({"ok": True, "pid": target_pid})
         except Exception as e:
-            self._json_response({"error": f"SIGUSR1 failed: {e}"}, status=500)
+            self._json_response({"error": f"Failed to trigger save: {e}"}, status=500)
 
     # ------------------------------------------------------------------
     # Dataset endpoints
@@ -6158,49 +6212,66 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         gpu_str = ",".join(str(g) for g in gpus)
         log_path = DATASETS_DIR / f"encode_{ds_id}.log"
+        half_flag = " --half" if half else ""
 
         # Write exclude file if any files were unchecked
-        exclude_file = None
+        exclude_flag = ""
         if exclude_set:
             exclude_file = output_dir / "exclude.txt"
             exclude_file.write_text("\n".join(sorted(exclude_set)) + "\n")
+            exclude_flag = f" --exclude-file {shlex.quote(str(exclude_file))}"
 
-        encode_args = [
-            str(VENV_PYTHON),
-            str(PRE_DIR / "pre_encode.py"),
-            "--input-dir", str(input_path),
-            "--model", model,
-            "--output-dir", str(output_dir),
-            "--num-gpus", str(len(gpus)),
-        ]
+        _q = shlex.quote
+        # Build the extra flags as a list (used directly on Windows)
+        encode_extra = []
         if half:
-            encode_args.append("--half")
-        if exclude_file is not None:
-            encode_args.extend(["--exclude-file", str(exclude_file)])
+            encode_extra.append("--half")
+        if exclude_set:
+            encode_extra += ["--exclude-file", str(exclude_file)]
 
-        encode_env = os.environ.copy()
-        encode_env.update({
-            "CUDA_VISIBLE_DEVICES": gpu_str,
-            "PYTHONUNBUFFERED": "1",
-            "MPLBACKEND": "Agg",
-        })
-
-        log_handle = None
         try:
-            log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
-            proc = _popen_managed(
-                encode_args,
-                cwd=str(BASE_DIR),
-                env=encode_env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
+            if _IS_WINDOWS:
+                win_env = {
+                    "CUDA_VISIBLE_DEVICES": gpu_str,
+                    "PYTHONUNBUFFERED": "1",
+                    "MPLBACKEND": "Agg",
+                    # Tell multiprocessing to use spawn (default on Windows anyway,
+                    # but some libraries try to set fork — this prevents that).
+                    "PYTORCH_SPAWN_METHOD": "spawn",
+                }
+                win_args = [
+                    str(PRE_DIR / "pre_encode.py"),
+                    "--input-dir", str(input_path),
+                    "--model", model,
+                    "--output-dir", str(output_dir),
+                    # Always 1 on Windows — multiprocessing fork doesn't work;
+                    # pre_encode.py's worker pool will run single-threaded.
+                    "--num-gpus", "1",
+                ] + encode_extra
+                print(f"[encode] Launching: {_find_venv_python()} {' '.join(str(a) for a in win_args)}")
+                print(f"[encode] Log: {log_path}")
+                proc = _make_win_launch(_find_venv_python(), win_env, None, win_args, str(log_path))
+            else:
+                cmd = (
+                    f"source {VENV_ACTIVATE} && "
+                    f"CUDA_VISIBLE_DEVICES={gpu_str} PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
+                    f"python3 {PRE_DIR / 'pre_encode.py'} "
+                    f"--input-dir {_q(str(input_path))} "
+                    f"--model {_q(model)} "
+                    f"--output-dir {_q(str(output_dir))} "
+                    f"--num-gpus {len(gpus)}"
+                    f"{half_flag}{exclude_flag} "
+                    f"2>&1 | tee {_q(str(log_path))}"
+                )
+                proc = subprocess.Popen(
+                    ["bash", "-c", cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    **_SUBPROCESS_KWARGS,
+                )
         except Exception as e:
             self._json_response({"error": f"Failed to launch: {e}"}, status=500)
             return
-        finally:
-            if log_handle is not None:
-                log_handle.close()
 
         # Build dataset file list (source of truth for which files are in this dataset)
         dataset_files = _build_dataset_files(str(input_path), exclude_set=exclude_set or None)
@@ -6511,7 +6582,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "session": c.parent.parent.name,
                 "step": effective,
                 "size_mb": round(st.st_size / 1e6, 1),
-                "path": _bash_path(_app_path(c)),
+                "path": str(c),
                 "mtime": st.st_mtime,
             }
             if dataset_history and len(dataset_history) > 1:
@@ -7236,16 +7307,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not run_audio_dir.exists():
             return result
 
-        # Use cached step data — steps are append-only, but the *latest* step's
-        # dir keeps growing as each cfg-scale clip lands. Invalidate the cache
-        # entry when its step_dir mtime advances so partial scans don't stick.
+        # Use cached step data — steps are append-only, only scan new dirs
         with DashboardHandler._demo_cache_lock:
             run_cache = DashboardHandler._demo_cache.get(run_id)
             if run_cache is None:
-                run_cache = {"steps": {}, "step_mtimes": {}}
+                run_cache = {"steps": {}}
                 DashboardHandler._demo_cache[run_id] = run_cache
             cached_steps = run_cache["steps"]
-            cached_mtimes = run_cache.setdefault("step_mtimes", {})
 
         # List step dirs (single readdir, very cheap)
         try:
@@ -7261,12 +7329,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 continue
             step = int(m.group(1))  # raw-PT loop saves with the authoritative global_step
 
-            try:
-                cur_mtime = step_dir.stat().st_mtime
-            except OSError:
-                cur_mtime = None
-
-            if step in cached_steps and cached_mtimes.get(step) == cur_mtime:
+            if step in cached_steps:
                 result["steps"].append(cached_steps[step])
                 continue
 
@@ -7322,8 +7385,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if clips:
                 with DashboardHandler._demo_cache_lock:
                     cached_steps[step] = step_entry
-                    if cur_mtime is not None:
-                        cached_mtimes[step] = cur_mtime
 
             result["steps"].append(step_entry)
         return result
@@ -7465,7 +7526,7 @@ if __name__ == "__main__":
             # a multi-line traceback to stderr (and thus into our server log).
             # Swallow those specifically; let everything else fall through.
             exc = sys.exc_info()[1]
-            if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
                 return
             super().handle_error(request, client_address)
     # If the requested port is taken, walk forward to find the next free one.
@@ -7475,15 +7536,15 @@ if __name__ == "__main__":
     bind_port = PORT
     for offset in range(50):
         try:
-            server = ThreadedHTTPServer((HOST, bind_port + offset), DashboardHandler)
+            server = ThreadedHTTPServer(("127.0.0.1", bind_port + offset), DashboardHandler)
             if offset:
                 print(f"Port {PORT} taken — using {bind_port + offset} instead.")
             break
         except OSError as e:
-            if e.errno != 98:  # EADDRINUSE
+            if e.errno not in (98, 10048):  # EADDRINUSE: Linux=98, Windows=10048
                 raise
     if server is None:
         raise RuntimeError(f"Could not find a free port in {PORT}..{PORT + 49}")
     actual_port = server.server_address[1]
-    print(f"Dashboard running on http://{HOST}:{actual_port}")
+    print(f"Dashboard running on http://127.0.0.1:{actual_port}")
     server.serve_forever()
