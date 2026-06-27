@@ -1554,7 +1554,8 @@ class GradioManager:
                 # Build env-var dict from the inline-shell strings
                 win_env = {"CUDA_VISIBLE_DEVICES": str(gpu),
                            "GRADIO_SERVER_PORT": str(port),
-                           "MPLBACKEND": "Agg"}
+                           "MPLBACKEND": "Agg",
+                           "GRADIO_SHARE": "False"}  # local URL only; remove this line to re-enable the public share URL
                 if backend_env.strip():
                     k, v = backend_env.strip().split("=", 1)
                     win_env[k] = v
@@ -1575,6 +1576,7 @@ class GradioManager:
                 cmd = (
                     f"source {VENV_ACTIVATE} && "
                     f"{backend_env}CUDA_VISIBLE_DEVICES={gpu} GRADIO_SERVER_PORT={port} "
+                    f"GRADIO_SHARE=False "  # local URL only; remove this line to re-enable the public share URL
                     f"PYTHONUNBUFFERED=1 MPLBACKEND=Agg "
                     f"{thread_env}"
                     f"python3 {RUN_GRADIO_SCRIPT} "
@@ -5110,11 +5112,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         for g in gpus:
             g["labels"] = gpu_labels.get(g["gpu"], [])
 
-        # Expose ARC availability per model for frontend
+        # Expose ARC availability per model for frontend.
+        # Frontend expects {model_key: {arc_type, diffusion_objective}} — send full objects.
         arc_info = {}
         for k, v in MODEL_INFO.items():
             if v.get("arc_type"):
-                arc_info[k] = v["arc_type"]
+                arc_info[k] = {"arc_type": v["arc_type"], "diffusion_objective": v.get("diffusion_objective")}
 
         return {"gpus": gpus, "gradio_estimate": _gradio_vram, "arc_info": arc_info}
 

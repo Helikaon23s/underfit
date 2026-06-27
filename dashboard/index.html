@@ -453,18 +453,12 @@
     #stat-hyperparams, #stat-dataset { grid-column: 1 / -1; }
   }
 
-  /* Run tabs — wrapper holds the layout-toggle (left of scroll area) + the
-     horizontally-scrolling tabs. Toggle is outside the scroll so tabs can't
-     slide behind it. */
-  .run-tabs-row {
-    display: flex; align-items: stretch; gap: 0;
+  /* Run tabs */
+  .run-tabs {
+    display: flex; gap: 0; overflow-x: auto; overflow-y: hidden;
     max-width: 1400px; margin: 8px auto -1px; padding: 0 24px;
   }
-  .run-tabs {
-    display: flex; gap: 0; flex: 1;
-    overflow-x: auto; overflow-y: hidden;
-    scrollbar-width: none; -ms-overflow-style: none;
-  }
+  .run-tabs { scrollbar-width: none; -ms-overflow-style: none; }
   .run-tabs::-webkit-scrollbar { display: none; }
   .run-tab {
     padding: 8px 18px; background: var(--bg3); border: 1px solid var(--border);
@@ -481,44 +475,6 @@
   }
   .run-tab.dragging { opacity: 0.4; }
   .run-tab.drag-over { border-left: 3px solid var(--accent2); }
-  /* Layout toggle (horizontal ⮀ ↔ vertical ⮁) — first child of .run-tabs-row,
-     sibling of the scrolling .run-tabs so tabs can't pass behind it. */
-  .run-tabs-toggle {
-    background: var(--bg3); border: 1px solid var(--border);
-    color: var(--text2); font-family: inherit; font-size: 1.05em; cursor: pointer;
-    padding: 4px 12px; border-radius: 6px 6px 0 0; margin-right: 6px;
-    flex-shrink: 0; line-height: 1; transition: all 0.15s;
-  }
-  .run-tabs-toggle:hover { color: var(--accent2); background: var(--bg2); }
-
-  /* Vertical-runs mode — left fixed sidebar, shifts the rest of the page right. */
-  body.vertical-runs { padding-left: 260px; }
-  body.vertical-runs .run-tabs-row {
-    position: fixed; left: 0; top: 0; bottom: 0; width: 260px;
-    max-width: none; margin: 0; padding: 0;
-    flex-direction: column; overflow: hidden;
-    background: var(--bg); border-right: 1px solid var(--border);
-    z-index: 100;
-  }
-  body.vertical-runs .run-tabs {
-    flex: 1; flex-direction: column;
-    overflow-x: hidden; overflow-y: auto;
-  }
-  body.vertical-runs .run-tab {
-    padding: 10px 14px; border: none; border-bottom: 1px solid var(--border);
-    border-radius: 0; margin: 0; width: 100%; text-align: left;
-    font-size: 0.85em;
-  }
-  body.vertical-runs .run-tab.active {
-    border-bottom: 1px solid var(--border); margin-bottom: 0;
-    background: rgba(124,58,237,0.15);
-  }
-  body.vertical-runs .run-tab.drag-over { border-left: none; border-top: 3px solid var(--accent2); }
-  body.vertical-runs .run-tabs-toggle {
-    width: 100%; padding: 12px 14px; border: none; border-bottom: 1px solid var(--border);
-    border-radius: 0; margin: 0; font-size: 1.25em; text-align: center;
-    background: var(--bg2);
-  }
   /* Checkpoint rows with inline Gradio */
   .ckpt-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.8em; flex-wrap: wrap; transition: background 1.5s ease-out; }
   .ckpt-row:last-child { border-bottom: none; }
@@ -863,9 +819,14 @@
   .ctrl-btn.dataset { border-color: var(--turquoise); color: var(--turquoise); }
   .ctrl-btn.dataset:hover { background: var(--turquoise); color: white; }
   .ctrl-btn:disabled { opacity: 0.3; cursor: not-allowed; filter: none; }
-  .delete-run-section { text-align: center; padding: 32px 0; margin-top: 24px; border-top: 1px solid var(--border); }
-  .ctrl-btn.delete { background: var(--red); color: white; border: 1px solid var(--red); display: inline-block; font-weight: 700; }
-  .ctrl-btn.delete:hover { filter: brightness(1.15); }
+  .delete-run-section { text-align: center; padding: 32px 0; margin-top: 24px; border-top: 1px solid var(--border); opacity: 0; transition: opacity 0.5s ease; }
+  .delete-run-section.visible { opacity: 1; }
+  .delete-trigger { background: none; border: none; cursor: pointer; font-size: 1.2em; padding: 4px 8px; opacity: 0.4; transition: opacity 0.15s; }
+  .delete-trigger:hover { opacity: 0.7; }
+  .ctrl-btn.delete { background: transparent; color: var(--red); border: 1px solid var(--red); opacity: 0.6; display: none; }
+  .ctrl-btn.delete.shown { display: inline-block; animation: fadeIn 0.2s ease; }
+  .ctrl-btn.delete:hover { opacity: 1; background: rgba(255,0,0,0.1); }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 0.6; } }
 
   /* Resume modal */
   .resume-input {
@@ -1040,10 +1001,7 @@
       </div>
     </div>
   </div>
-  <div class="run-tabs-row" id="run-tabs-row">
-    <button class="run-tabs-toggle" id="run-tabs-toggle" onclick="toggleRunsLayout()" title="Switch to vertical tabs">⮀</button>
-    <div class="run-tabs" id="run-tabs"></div>
-  </div>
+  <div class="run-tabs" id="run-tabs"></div>
 </div>
 
 <div class="main">
@@ -1165,6 +1123,7 @@
     <div id="demo-content"></div>
   </div>
   <div class="delete-run-section" id="delete-run-section">
+    <button class="delete-trigger" id="delete-trigger" onclick="showDeleteBtn()">&#10060;</button>
     <button class="ctrl-btn delete" id="delete-btn" onclick="deleteRun()">DELETE TRAINING RUN</button>
   </div>
   </div><!-- /run-detail -->
@@ -1861,7 +1820,7 @@ class MetricChart {
 }
 
 // Escape a string for safe use inside HTML attribute values (onclick="...")
-function escAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function escAttr(s) { return String(s).replace(/\\/g,'\\\\').replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
 
 const chart = new MetricChart(document.getElementById('loss-chart'), {
   valueKey: 'loss', color: '#a78bfa', fillColor: 'rgba(124,58,237,0.25)', precision: 3
@@ -1915,7 +1874,6 @@ const _nanRunIds = new Set();  // runs that have NaN'd out
 let _trackAbort = null;
 let _isDragging = false;
 let gradioInstances = [];
-let _currentCheckpointsPayload = null;
 let _gpuModalCkptPath = null;
 let _gpuModalCkptName = null;
 let _selectedGpu = null;
@@ -3577,42 +3535,10 @@ async function loadRuns() {
   }
 }
 
-// Runs layout: 'horizontal' (default, top tab strip) or 'vertical' (left sidebar).
-let _runsLayout = (function() {
-  try { return localStorage.getItem('underfit:runsLayout') || 'horizontal'; }
-  catch (_) { return 'horizontal'; }
-})();
-function _applyRunsLayout() {
-  document.body.classList.toggle('vertical-runs', _runsLayout === 'vertical');
-  const tBtn = document.getElementById('run-tabs-toggle');
-  if (tBtn) {
-    tBtn.innerHTML = (_runsLayout === 'horizontal') ? '⮀' : '⮁';
-    tBtn.title = (_runsLayout === 'horizontal') ? 'Switch to vertical tabs' : 'Switch to horizontal tabs';
-  }
-}
-_applyRunsLayout();
-window.toggleRunsLayout = function() {
-  _runsLayout = (_runsLayout === 'horizontal') ? 'vertical' : 'horizontal';
-  try { localStorage.setItem('underfit:runsLayout', _runsLayout); } catch (_) {}
-  _applyRunsLayout();
-  // Reset the off-axis scroll — leftover scrollLeft from horizontal mode
-  // would otherwise visually offset the vertical column (and vice versa).
-  const rt = document.getElementById('run-tabs');
-  if (rt) {
-    if (_runsLayout === 'vertical') rt.scrollLeft = 0;
-    else rt.scrollTop = 0;
-  }
-  // Re-render so DOM iteration order matches the new visual order,
-  // then renderTabs' own mode-aware scrollIntoView centers the active tab.
-  renderTabs();
-};
-
 function renderTabs() {
   const container = document.getElementById('run-tabs');
   container.innerHTML = '';
-  // Vertical mode reverses iteration so newest is at the top (visually + in DOM).
-  const ordered = (_runsLayout === 'vertical') ? runsData.slice().reverse() : runsData;
-  for (const run of ordered) {
+  for (const run of runsData) {
     const btn = document.createElement('button');
     btn.className = 'run-tab' + (run.id === currentRunId ? ' active' : '');
     btn.setAttribute('data-run-id', run.id);
@@ -3657,15 +3583,9 @@ function renderTabs() {
     });
     container.appendChild(btn);
   }
-  // Scroll active tab into view — center on the scrollable axis for whichever
-  // orientation is active. `nearest` on the off-axis avoids extraneous scroll.
+  // Scroll active tab into view
   const activeTab = container.querySelector('.run-tab.active');
-  if (activeTab) {
-    const opts = (_runsLayout === 'vertical')
-      ? { block: 'center', inline: 'nearest', behavior: 'instant' }
-      : { inline: 'center', block: 'nearest', behavior: 'instant' };
-    activeTab.scrollIntoView(opts);
-  }
+  if (activeTab) activeTab.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'instant' });
 }
 
 // Set of run IDs whose Console Output state has been "settled" for this
@@ -4091,7 +4011,6 @@ function _renderStatus(status, refreshRunId) {
 
 function _renderCheckpoints(data, refreshRunId) {
     if (currentRunId !== refreshRunId) return;
-    _currentCheckpointsPayload = data;
     const checkpoints = data.checkpoints || [];
     _currentCheckpoints = checkpoints;
     const ckptEvery = data.checkpoint_every || (_currentStatus && _currentStatus.hyperparams ? _currentStatus.hyperparams.checkpoint_every : null);
@@ -4172,8 +4091,7 @@ function _renderCheckpoints(data, refreshRunId) {
         const dsTag = c.dataset_name ? `<span class="ckpt-ds" title="${c.dataset_name}">${c.dataset_name}</span>` : '';
         const dlUrl = `/api/download?path=${encodeURIComponent(c.path)}`;
         const displayName = c.name.replace(/\.(safetensors|ckpt)$/, '');
-        const dlBtn = `<a href="${dlUrl}" class="gradio-btn launch" style="padding-left:6px;padding-right:6px;min-width:30px" title="Download LoRA (${c.size_mb} MB)">⬇</a>`;
-        return `<div class="ckpt-row" data-ckpt-path="${c.path}"><span class="ckpt-info">${mtime}${sessionTag}<span class="ckpt-name">${displayName}</span><span class="ckpt-size">${c.size_mb} MB</span>${dlBtn}${dsTag}</span><span class="ckpt-actions">${gradioHtml}</span></div>`;
+        return `<div class="ckpt-row" data-ckpt-path="${c.path}"><span class="ckpt-info">${mtime}${sessionTag}<span class="ckpt-name">${displayName}</span><a href="${dlUrl}" class="ckpt-dl" title="Download checkpoint">${c.size_mb} MB ⬇</a>${dsTag}</span><span class="ckpt-actions">${gradioHtml}</span></div>`;
       }
 
       // Split into pinned (active Gradio) and rest
@@ -4305,10 +4223,12 @@ async function refresh() {
       return;
     }
     const refreshRunId = currentRunId;  // snapshot AFTER loadRuns so first call doesn't abort
-    // Delete section: hidden until a run is selected, then fade in after content loads.
+    // Reset delete section: hide full button, show cross, fade in after content loads
     const delSection = document.getElementById('delete-run-section');
     delSection.classList.remove('visible');
     delSection.style.display = currentRunId ? '' : 'none';
+    document.getElementById('delete-trigger').style.display = '';
+    document.getElementById('delete-btn').classList.remove('shown');
     // Fire all fetches independently — each section renders when its data arrives.
     // When USE_SSE is on, status / checkpoints / demos / gradio all come via
     // the long-lived /api/stream connection, so these one-off fetches would
@@ -4424,6 +4344,11 @@ window.killTraining = async function() {
   } catch (e) { alert('Kill failed: ' + e); }
   _controlPending = false;
   await refresh();
+};
+
+window.showDeleteBtn = function() {
+  document.getElementById('delete-trigger').style.display = 'none';
+  document.getElementById('delete-btn').classList.add('shown');
 };
 
 window.deleteRun = async function() {
@@ -8001,16 +7926,14 @@ function _streamConnect() {
         _renderLbtChart();
       }
     }
-    if (d.gradio) {
-      gradioInstances = d.gradio;
-    }
     if (d.checkpoints) {
       _renderCheckpoints(d.checkpoints, currentRunId);
-    } else if (d.gradio && _currentCheckpointsPayload) {
-      _renderCheckpoints(_currentCheckpointsPayload, currentRunId);
     }
     if (d.demos) {
       _renderDemos(d.demos, currentRunId);
+    }
+    if (d.gradio) {
+      gradioInstances = d.gradio;
     }
   };
   _streamSource.onerror = (_e) => {
