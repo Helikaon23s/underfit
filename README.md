@@ -16,33 +16,26 @@ Linux box with an NVIDIA GPU, `git`, and `curl`. Everything else gets fetched au
 
 ```bash
 git clone https://github.com/dada-bots/underfit && cd underfit
-./install.sh                            # ~5 min: installs uv, syncs deps, clones SA3, downloads model packs
-./run.sh                                # serves the dashboard on http://localhost:8787
+./install.bat                            # ~5 min: installs uv, syncs deps, clones SA3, downloads model packs
+./run.bat                                # serves the dashboard on http://localhost:8787
 ```
 
 Open the URL in a browser, click **+ New Dataset** to star
 
 > **First time only** — open https://huggingface.co/stabilityai/stable-audio-3-medium and click *Agree and access repository*. The three SA3 ARC repos share one license; one click unlocks all three. Approval is instant. Without it the install fails with `401 Unauthorized` on the ARC checkpoint downloads. (The base checkpoints aren't gated.)
 
-> To reach the dashboard in your browser If your linux box is remote, you'll need to either tunnel to localhost:8787 over ssh, or use NGROK (recommended) to forward a domain to http://localhost:8787 
+> KNOWN ISSUES with Windows Version - 1. clicking the Launch button next to each checkpoint will not launch Stable Audio 3   2. manual Save Checkpoint button does not work 3. colab not tested - txt removed from below 
 
-
----
-
-
-## Quickstart — Google Colab
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb) 
-
-Jankier than running locally, but still works. Read more here: https://github.com/dada-bots/underfit#running-on-colab
+> Linux only code changed to Windows , Remote not tested / comments removed , added lines to run.bat to show that gpu torch is installed ok
 
 ---
+
 
 ## Requirements
 
 |                | |
 |---             |---|
-| **OS**         | Linux. (Windows untested.) |
+| **OS**         | (Windows tested with 24 GB vram 4090.) |
 | **GPU**        | NVIDIA. ≥16 GB VRAM ideal. 8 GB still works with minimal settings: fp16 base model + low rank + small latent crop + batch 1 |
 | **Python**     | 3.10 (auto-fetched by `uv`). |
 | **Disk**       | Plan for ~17 GB per SA3-medium pack, ~7 GB per small pack. All three = ~31 GB of checkpoints. Datasets add a few hundred MB each. |
@@ -232,9 +225,9 @@ In the dashboard's checkpoints list, click the download (⬇) button — or grab
 
 ## Run inference with your LoRA
 
-### From the dashboard
+### From the dashboard - Currently not working on this version
 
-Click [Launch] on any checkpoint. Spins up a private Gradio link. Knobs:
+Currently not working - Click [Launch] on any checkpoint. Spins up a private Gradio link. Knobs:
 
 - **LoRA strength <1.0** — blends LoRA with base model. A heavily-trained / "memorised" checkpoint often sounds best around 0.6–0.8 — gives you "in the style of" without straight regurgitation.
 - **LoRA interval (skip first step)** — the very first denoising step establishes song structure, so skipping the LoRA here prevents it from regurgitating any song. Instead the base model determines the song structure fron the prompt. 
@@ -259,28 +252,7 @@ Pass multiple `.safetensors` to blend LoRAs. Strengths interact non-linearly —
 
 ---
 
-## Running on Colab
-
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dada-bots/underfit/blob/main/underfit-colab.ipynb)
-
-Same underfit, same dashboard, just hosted on Colab's GPU instead of yours. The notebook walks through everything end-to-end. Definitely jankier than running it locally yourself. 
-
-### Why Colab
-
-Zero install on your machine. Free GPU access for experimenting. Free tier is slow (T4). Pro tier ($9.99) gets you a H100 which is fast.
-
-### Important Colab-specific quirks
-
-**Pre-emption.** At some point your session will time-out and get canceled. Ephemeral storage will be deleted. However, Google Drive integration means your runs persist across sessions. On the next reboot, the backup logs, checkpoints, training runs will be available in the dashboard.
-
-**Use ngrok in Step 4.** Colab's built-in port-proxy buffers HTTP responses aggressively, which makes the dashboard feel laggy and occasionally freeze. Audio playback is the worst offender — the proxy holds the entire audio file before forwarding to your browser instead of streaming it, blocking every other request until done. *Training itself is unaffected* — it runs as a detached subprocess on the GPU and survives dashboard freezes or closed tabs. Free signup at [ngrok.com](https://ngrok.com) and paste your auth token into the `NGROK_AUTHTOKEN` field in Step 4. If anything ever freezes, re-run Step 4 to restart the server. Colab is nice, but using a normal Linux box is the most reliable setup. 
-
-
-### Colab troubleshooting
-
-- **"NO GPU DETECTED" in Step 1** → Runtime → Change runtime type → Hardware accelerator → pick a GPU → Save. Re-run Step 1.
-- **`401 Unauthorized` / `GatedRepoError` in Step 3** → Accept the SA3 license at https://huggingface.co/stabilityai/stable-audio-3-medium. One click unlocks all three ARC repos. Re-run Step 3.
-- **Dashboard frozen** → re-run Step 4. Training runs are unaffected.
+## Running on Colab - section deleted as not teste
 
 ---
 
