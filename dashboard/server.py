@@ -72,10 +72,35 @@ def _make_win_launch(python_exe, env_vars, cwd, args, log_path):
         **_SUBPROCESS_KWARGS,
     )
 
+    # Noise patterns from the asyncio ProactorBasePipeTransport on Windows that
+    # spam the cmd window whenever a browser tab closes a streaming connection.
+    _ASYNCIO_NOISE = (
+        "_ProactorBasePipeTransport._call_connection_lost",
+        "_call_connection_lost",
+        "self._sock.shutdown(socket.SHUT_RDWR)",
+        "ConnectionResetError: [WinError 10054]",
+        "handle: <Handle _ProactorBasePipeTransport",
+        "ERROR:asyncio:Exception in callback",
+        "asyncio\\events.py",
+        "asyncio\\proactor_events.py",
+    )
+
     def _tee():
+        _skip_block = False
         try:
             for raw_line in proc.stdout:
                 text = raw_line.decode("utf-8", errors="replace")
+                # Suppress asyncio ProactorBasePipeTransport noise on Windows.
+                # These fire whenever a browser tab closes mid-stream; they are
+                # harmless but flood the cmd window when Gradio is running.
+                if any(noise in text for noise in _ASYNCIO_NOISE):
+                    _skip_block = True
+                    continue
+                if _skip_block:
+                    # Keep skipping blank / whitespace-only continuation lines
+                    if text.strip() == "":
+                        continue
+                    _skip_block = False
                 log_file.write(text)
                 log_file.flush()
         finally:
@@ -2647,6 +2672,128 @@ def _query_gpu_mem():
         return {}
 
 
+# ── stable_audio_demos watcher ──────────────────────────────────────────────
+# Monitors BASE_DIR/stable_audio_demos for new WAV files produced by a launched
+# Gradio / Stable Audio 3 instance.  For each new WAV it:
+#   1. Renames it to a UK date-time stamp  (YYYY-MM-DD_HH-MM-SS.wav)
+#   2. Writes the original filename (the prompt) into the WAV Comment tag
+#   3. Moves any sibling .webp waveform image to live next to the renamed wav
+# This avoids filenames with commas (which break some players) and keeps the
+# waveform image co-located with its audio so the folder stays tidy.
+
+_STABLE_AUDIO_DEMOS_DIR = BASE_DIR / "stable_audio_demos"
+
+def _write_wav_comment(wav_path: Path, comment: str):
+    """Embed comment into a WAV file using the LIST INFO ICMT chunk.
+    Reads the file, patches/appends the RIFF LIST INFO block, rewrites in-place.
+    Falls back silently if the file can't be parsed.
+    """
+    try:
+        import struct
+        data = wav_path.read_bytes()
+        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+            return  # not a valid WAV
+
+        # Encode comment as null-terminated Latin-1 (RIFF standard), padded to even length
+        enc = (comment[:500].encode("latin-1", errors="replace") + b"\x00")
+        if len(enc) % 2:
+            enc += b"\x00"
+
+        icmt_chunk = b"ICMT" + struct.pack("<I", len(enc)) + enc
+        list_chunk = b"LIST" + struct.pack("<I", 4 + len(icmt_chunk)) + b"INFO" + icmt_chunk
+
+        # Strip any existing LIST INFO block
+        out = bytearray(data[:12])
+        i = 12
+        while i + 8 <= len(data):
+            cid = data[i:i+4]
+            csz = struct.unpack_from("<I", data, i+4)[0]
+            chunk_end = i + 8 + csz + (csz % 2)  # RIFF chunks are word-aligned
+            if cid == b"LIST" and i + 12 <= len(data) and data[i+8:i+12] == b"INFO":
+                i = chunk_end
+                continue
+            out += data[i:min(chunk_end, len(data))]
+            i = chunk_end
+
+        out += list_chunk
+        # Fix RIFF size field
+        struct.pack_into("<I", out, 4, len(out) - 8)
+        wav_path.write_bytes(bytes(out))
+    except Exception:
+        pass  # tagging is best-effort; never break the rename
+
+
+def stable_audio_demos_watcher():
+    """Background thread: watch stable_audio_demos for new WAVs and tidy them up."""
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    _STABLE_AUDIO_DEMOS_DIR.mkdir(parents=True, exist_ok=True)
+    seen: set = set()
+
+    # Seed with files already present so we don't process old ones on startup
+    for f in _STABLE_AUDIO_DEMOS_DIR.iterdir():
+        seen.add(f.name)
+
+    while True:
+        try:
+            _time.sleep(2)
+            current = {f.name: f for f in _STABLE_AUDIO_DEMOS_DIR.iterdir()}
+            new_files = [p for name, p in current.items()
+                         if name not in seen and p.suffix.lower() == ".wav"]
+            for wav in new_files:
+                seen.add(wav.name)
+                try:
+                    # Wait briefly for the file to finish being written
+                    _time.sleep(1)
+                    if not wav.exists():
+                        continue
+
+                    # Build UK timestamp filename
+                    uk_tz = _tz.utc  # server may not have pytz; UTC is close enough for logging
+                    try:
+                        import zoneinfo as _zi
+                        uk_tz = _zi.ZoneInfo("Europe/London")
+                    except Exception:
+                        pass
+                    stamp = _dt.now(uk_tz).strftime("%Y-%m-%d_%H-%M-%S")
+                    new_wav = _STABLE_AUDIO_DEMOS_DIR / f"{stamp}.wav"
+                    # Avoid collision if two tracks finish within the same second
+                    suffix_n = 0
+                    while new_wav.exists():
+                        suffix_n += 1
+                        new_wav = _STABLE_AUDIO_DEMOS_DIR / f"{stamp}_{suffix_n}.wav"
+
+                    # The original stem is the prompt (minus extension, with underscores/spaces)
+                    prompt_text = wav.stem.replace("_", " ").strip()
+
+                    # Write Comment tag before renaming
+                    _write_wav_comment(wav, prompt_text)
+
+                    wav.rename(new_wav)
+                    seen.add(new_wav.name)
+
+                    # Move any sibling webp (same stem) next to the renamed wav
+                    webp_src = wav.with_suffix(".webp")
+                    if not webp_src.exists():
+                        # Sometimes the webp arrives slightly later — wait a moment
+                        _time.sleep(1.5)
+                    if webp_src.exists():
+                        webp_dst = new_wav.with_suffix(".webp")
+                        webp_src.rename(webp_dst)
+                        seen.add(webp_dst.name)
+
+                    print(f"[demos] Saved: {new_wav.name}  prompt: {prompt_text[:60]}", flush=True)
+                except Exception as e:
+                    print(f"[demos] Error processing {wav.name}: {e}", flush=True)
+
+            # Mark any newly appeared non-wav files as seen too
+            for name in current:
+                seen.add(name)
+        except Exception:
+            _time.sleep(5)
+
+
 def vram_sampler():
     """Background thread: sample VRAM every 10s for each GPU and active training run."""
     _cycle = 0
@@ -4280,7 +4427,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not m:
             self._json_response({"error": "cannot parse --model-config from restart_cmd"}, status=500)
             return
-        orig_model_config = Path(m.group(1))
+        orig_model_config = Path(m.group(1).strip("'\""))
         run_dir = orig_model_config.parent
         # Strip existing _resume suffix so successive resumes don't nest names
         base_stem = re.sub(r"_resume$", "", orig_model_config.stem)
@@ -4344,9 +4491,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         resume_ds_path = None
 
         # Build new restart_cmd — max_steps is absolute since StepOffsetCallback offsets global_step
-        new_cmd = re.sub(r"--model-config\s+\S+", f"--model-config {resume_config_path}", restart_cmd)
+        # On Windows, shlex.quote() wraps paths in single-quotes which then get
+        # embedded as literal characters in the path string, causing [Errno 22].
+        # Use double-quotes on Windows (compatible with the arg parser) and
+        # shlex.quote (single-quotes) on POSIX.
+        def _quote_path_for_cmd(p):
+            s = str(p)
+            if _IS_WINDOWS:
+                return f'"{s}"'
+            return shlex.quote(s)
+
+        # Use lambda replacements so Windows backslashes in paths are never
+        # interpreted as regex escape sequences by re.sub (e.g. \S, \U -> error).
+        _model_repl = f"--model-config {_quote_path_for_cmd(resume_config_path)}"
+        new_cmd = re.sub(r"--model-config\s+\S+", lambda _: _model_repl, restart_cmd)
         if resume_ds_path:
-            new_cmd = re.sub(r"--dataset-config\s+\S+", f"--dataset-config {resume_ds_path}", new_cmd)
+            _ds_repl = f"--dataset-config {_quote_path_for_cmd(resume_ds_path)}"
+            new_cmd = re.sub(r"--dataset-config\s+\S+", lambda _: _ds_repl, new_cmd)
         new_cmd = re.sub(r"--max-steps\s+\d+", f"--max-steps {new_max_steps}", new_cmd)
         if batch_size:
             new_cmd = re.sub(r"--batch-size\s+\d+", f"--batch-size {int(batch_size)}", new_cmd)
@@ -7519,6 +7680,10 @@ if __name__ == "__main__":
     vt = threading.Thread(target=vram_sampler, daemon=True)
     vt.start()
     print("VRAM sampler started.")
+    # stable_audio_demos_watcher disabled — file copying is handled inside
+    # run_gradio.py via postprocess hooks to avoid Windows file-lock issues.
+    # sad = threading.Thread(target=stable_audio_demos_watcher, daemon=True)
+    # sad.start()
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
